@@ -19,7 +19,8 @@ Feature sets, one per output folder, all on the same utterances so they can be
 concatenated (probe / mil: --encoder egemaps+prosody):
 
   prosody          PROSODY_NAMES — timing and pitch measured directly:
-                   speaking rate (syllables per second of speech, syllables counted
+                   speaking rate (syllables per second of the transcribed segments,
+                   pauses included; missing without a transcript; syllables counted
                    from the TextGrid text: aksharas for Indic scripts, vowel groups
                    for English), pauses inside the utterance, the pause before it
                    and whether it answers another speaker's turn (pause_before_sec
@@ -185,13 +186,15 @@ def slope(y: np.ndarray, t: np.ndarray) -> float:
 def prosody(utts, speech, other, mine, f0, loud) -> np.ndarray:
     """(n_utts, len(PROSODY_NAMES)) — see the module docstring."""
     n = len(speech)
-    # syllables spread evenly over the speech frames of the segment they were said in
-    density = np.zeros(n)
+    # Syllables per second of the transcribed segment they were said in, over its whole
+    # duration. Dividing by detected speech frames instead inflated the rate wherever the
+    # interviewer overlapped (those frames are removed from `speech`, the words are not).
+    density, covered = np.zeros(n), np.zeros(n, bool)
     for a, b, text in mine:
         s, e = int(round(a / HOP)), int(round(b / HOP))
-        k = speech[s:e].sum()
-        if k:
-            density[s:e][speech[s:e]] = syllables(text) / k
+        if e > s:
+            density[s:e] = syllables(text) / ((e - s) * HOP)
+            covered[s:e] = True
     # Another speaker's run counts as a turn (a question the utterance answers) only
     # if it lasts TURN_SEC; shorter ones are back-channels ("hmm") over the participant.
     turn = np.zeros(n, bool)
@@ -212,7 +215,7 @@ def prosody(utts, speech, other, mine, f0, loud) -> np.ndarray:
         rows.append([
             (e - s) * HOP,
             sp.mean(),
-            density[s:e].sum() / (n_sp * HOP),
+            density[s:e][covered[s:e]].mean() if covered[s:e].any() else np.nan,
             len(pauses) / ((e - s) * HOP),
             np.mean(pauses) * HOP if pauses else 0.0,
             min((s - last) * HOP, 5.0) if last is not None else 5.0,

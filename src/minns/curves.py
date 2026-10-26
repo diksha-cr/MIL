@@ -101,8 +101,9 @@ def plot(path: Path, title: str, y: np.ndarray, curves: list[tuple[str, np.ndarr
         ax.tick_params(length=0)
         for s in ax.spines.values():
             s.set_visible(False)
-        ax.set_title(label, fontsize=9.5, color=INK, pad=8)
-        ax.add_patch(matplotlib.patches.Rectangle((-0.5, -0.75), 1.0, 0.12, color=color, clip_on=False))
+        ax.set_title(label, fontsize=9.5, color=INK, pad=8, loc="left", x=0.09)
+        ax.add_patch(matplotlib.patches.Rectangle((0, 1.035), 0.06, 0.06, color=color, clip_on=False,
+                                                  transform=ax.transAxes))
     fig.savefig(path, dpi=160, bbox_inches="tight", facecolor=SURFACE)
 
 
@@ -119,7 +120,7 @@ def main() -> None:
     if len(configs) > len(SERIES):
         raise SystemExit(f"at most {len(SERIES)} configs per figure")
     oof_path = args.csv.with_name(args.csv.stem + "_oof.npz")
-    z = np.load(oof_path, allow_pickle=False)
+    z = np.load(oof_path, allow_pickle=True)    # our own run's file; older runs saved ids as objects
     names = z["config"].tolist()
     missing = [c for c in configs if c not in names]
     if missing:

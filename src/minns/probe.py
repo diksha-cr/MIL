@@ -217,7 +217,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = f"probe_{args.encoder}_{args.cv}_C{args.C:g}"
     summary.to_csv(out_dir / f"{stem}.csv")
-    np.savez_compressed(out_dir / f"{stem}_oof.npz", participant_id=train["participant_id"].to_numpy(),
+    np.savez_compressed(out_dir / f"{stem}_oof.npz", participant_id=train["participant_id"].to_numpy(dtype=str),
                         config=np.array(list(oof)), prob=np.stack(list(oof.values())))
     print(f"\n{len(summary)} configs in {(time.time() - t0) / 60:.1f} min -> {out_dir / stem}.csv")
     print(f"\nTop 15 by fold AUC (selection-biased):\n{format_summary(summary, top=15)}")

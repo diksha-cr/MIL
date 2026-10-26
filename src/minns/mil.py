@@ -273,7 +273,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = f"mil_{args.encoder}_{args.cv}" + ("_linear" if all(m.startswith("lin-") for m in args.models) else "")
     summary.to_csv(out_dir / f"{stem}.csv")
-    np.savez_compressed(out_dir / f"{stem}_oof.npz", participant_id=train["participant_id"].to_numpy(),
+    np.savez_compressed(out_dir / f"{stem}_oof.npz", participant_id=train["participant_id"].to_numpy(dtype=str),
                         config=np.array(list(oofs)), prob=np.stack(list(oofs.values())))
     print(f"\n{len(summary)} configs in {(time.time() - t0) / 60:.1f} min -> {out_dir / stem}.csv")
     print(f"\nAll configs by fold AUC:\n{format_summary(summary)}")
