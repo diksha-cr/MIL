@@ -60,7 +60,11 @@ LINEAR_MODELS = ("lin-mean", "lin-max", "lin-lse5", "lin-lse10")
 # ── bags ──────────────────────────────────────────────────────────────────────
 
 def padded_bags(X: np.ndarray, owner: np.ndarray, bags: np.ndarray, device: str):
-    """(n_bags, T_max, D) float16 tensor, (n_bags, T_max) bool mask, lengths — for `bags`, in that order.
+    """(n_bags, T_max, D) tensor, (n_bags, T_max) bool mask, lengths — for `bags`, in that order.
+
+    float16 for encoder states, float32 for float32 inputs (hand-made features, whose
+    ratios can exceed float16's range). Non-finite values become NaN, imputed after
+    standardising (see fit_predict_fold).
 
     `owner` is non-decreasing (load_packed writes bags in participant order), so
     every bag is one contiguous slice of X.
@@ -68,9 +72,10 @@ def padded_bags(X: np.ndarray, owner: np.ndarray, bags: np.ndarray, device: str)
     starts = np.searchsorted(owner, bags, side="left")
     ends = np.searchsorted(owner, bags, side="right")
     lengths = ends - starts
-    out = np.zeros((len(bags), lengths.max(), X.shape[1]), dtype=np.float16)
+    out = np.zeros((len(bags), lengths.max(), X.shape[1]), dtype=np.float32 if X.dtype == np.float32 else np.float16)
     for i, (s, e) in enumerate(zip(starts, ends)):
         out[i, :e - s] = X[s:e]
+    out[~np.isfinite(out)] = np.nan
     mask = np.arange(lengths.max())[None, :] < lengths[:, None]
     return (torch.from_numpy(out).to(device), torch.from_numpy(mask).to(device),
             torch.from_numpy(lengths).to(device))
@@ -155,12 +160,18 @@ def fit_predict_fold(X, mask, lengths, y, tr, va, models, n_seeds, epochs, devic
     tr_t, va_t = torch.as_tensor(tr, device=device), torch.as_tensor(va, device=device)
     yt = torch.as_tensor(y, dtype=torch.float32, device=device)
 
-    # Standardise with statistics of the training bags' windows only.
-    xs, ms = X[tr_t].float(), mask[tr_t][..., None]
-    n = ms.sum()
-    mu = (xs * ms).sum((0, 1)) / n
-    sd = (((xs - mu) * ms) ** 2).sum((0, 1)).div(n).sqrt().clamp(min=1e-6)
-    del xs, ms
+    # Standardise with statistics of the training bags' windows only, skipping missing
+    # values; a missing value then becomes 0 (the training mean), as in the probe.
+    xs = X[tr_t].float()
+    ok = mask[tr_t][..., None] & xs.isfinite()
+    xs = xs.nan_to_num(0.0)
+    n = ok.sum((0, 1)).clamp(min=1)
+    mu = (xs * ok).sum((0, 1)) / n
+    sd = (((xs - mu) * ok) ** 2).sum((0, 1)).div(n).sqrt().clamp(min=1e-6)
+    del xs, ok
+
+    def standardise(x):
+        return ((x.float() - mu) / sd).nan_to_num(0.0)
 
     n_pos = float(y[tr].sum())
     class_w = torch.tensor([len(tr) / (2 * (len(tr) - n_pos)), len(tr) / (2 * n_pos)], device=device)
@@ -168,12 +179,12 @@ def fit_predict_fold(X, mask, lengths, y, tr, va, models, n_seeds, epochs, devic
 
     def batch(idx):                     # trim padding to the longest bag in the batch
         t = int(lengths[idx].max())
-        return (X[idx, :t].float() - mu) / sd, mask[idx, :t]
+        return standardise(X[idx, :t]), mask[idx, :t]
 
     out = {}
     linear = [m for m in models if m.startswith("lin-")]
     if linear:
-        Xtr, Xva = (X[tr_t].float() - mu) / sd, (X[va_t].float() - mu) / sd
+        Xtr, Xva = standardise(X[tr_t]), standardise(X[va_t])
         for model_name in linear:
             out[model_name] = fit_linear(Xtr, mask[tr_t], yt[tr_t], wt[tr_t], Xva, mask[va_t],
                                          model_name.split("-", 1)[1], C)

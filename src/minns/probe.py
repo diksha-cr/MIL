@@ -51,7 +51,7 @@ def window_key(w: str) -> str:
 
 
 def load_packed(encoder: str, key: str, pids: list[str]) -> tuple[np.ndarray, np.ndarray]:
-    """(features (L, N, D) float16 memmap, owner (N,) row index into `pids`).
+    """(features (L, N, D) memmap in the npz dtype, owner (N,) row index into `pids`).
 
     The per-participant npz files are repacked once per (encoder, key) into a
     layer-major .npy so a single layer is one contiguous read. `key` is "full",
@@ -76,13 +76,17 @@ def load_packed(encoder: str, key: str, pids: list[str]) -> tuple[np.ndarray, np
     dst.mkdir(parents=True, exist_ok=True)
     arr_path, meta_path = dst / f"{key}.npy", dst / f"{key}.json"
 
-    if arr_path.exists() and meta_path.exists() and json.loads(meta_path.read_text())["pids"] == pids:
-        owner = np.load(dst / f"{key}_owner.npy")
-        return np.load(arr_path, mmap_mode="r"), owner
-
     missing = [p for p in pids if not (src / f"{p}.npz").exists()]
     if missing:
         raise SystemExit(f"{len(missing)} participants not extracted yet for {encoder} (e.g. {missing[0]})")
+
+    # Reuse the pack unless the participants changed or a source file was rewritten
+    # after it (re-extraction, re-segmentation with --overwrite).
+    newest = max((src / f"{p}.npz").stat().st_mtime for p in pids)
+    if (arr_path.exists() and meta_path.exists() and json.loads(meta_path.read_text())["pids"] == pids
+            and arr_path.stat().st_mtime >= newest):
+        owner = np.load(dst / f"{key}_owner.npy")
+        return np.load(arr_path, mmap_mode="r"), owner
 
     if key == "full":
         counts = [1] * len(pids)
@@ -90,7 +94,7 @@ def load_packed(encoder: str, key: str, pids: list[str]) -> tuple[np.ndarray, np
         counts = [len(np.load(src / f"{p}.npz")[f"{key}_span"]) for p in pids]
     first = np.load(src / f"{pids[0]}.npz")[key]
     n_layers, dim = first.shape[-2:]
-    out = np.lib.format.open_memmap(arr_path, mode="w+", dtype=np.float16,
+    out = np.lib.format.open_memmap(arr_path, mode="w+", dtype=first.dtype,
                                     shape=(n_layers, sum(counts), dim))
     off = 0
     for p, n in zip(pids, counts):
@@ -125,6 +129,14 @@ def pool_scores(prob: np.ndarray, owner: np.ndarray, bags: np.ndarray) -> dict[s
 
 # ── one fold, one layer ───────────────────────────────────────────────────────
 
+def finite(X: np.ndarray) -> np.ndarray:
+    """float32 copy with inf / NaN as NaN. After standardising, np.nan_to_num turns
+    them into 0, i.e. the training mean: a missing value says nothing either way."""
+    X = np.array(X, dtype=np.float32)
+    X[~np.isfinite(X)] = np.nan
+    return X
+
+
 def instance_weights(owner: np.ndarray, y_bag: np.ndarray) -> np.ndarray:
     """Each bag weighs 1 in total, split evenly over its windows; classes balanced at bag level."""
     bags, counts = np.unique(owner, return_counts=True)
@@ -137,11 +149,12 @@ def instance_weights(owner: np.ndarray, y_bag: np.ndarray) -> np.ndarray:
 def fit_layer(X_layer: np.ndarray, owner: np.ndarray, y_bag: np.ndarray,
               tr_bags: np.ndarray, va_bags: np.ndarray, C: float, pooled: bool) -> dict[str, np.ndarray]:
     tr_m, va_m = np.isin(owner, tr_bags), np.isin(owner, va_bags)
-    Xtr = np.asarray(X_layer[tr_m], dtype=np.float32)
-    scaler = StandardScaler().fit(Xtr)
+    Xtr = finite(X_layer[tr_m])
+    scaler = StandardScaler().fit(Xtr)                 # ignores NaN when fitting
     clf = LogisticRegression(C=C, max_iter=2000, random_state=SEED)
-    clf.fit(scaler.transform(Xtr), y_bag[owner[tr_m]], sample_weight=instance_weights(owner[tr_m], y_bag))
-    prob = clf.predict_proba(scaler.transform(np.asarray(X_layer[va_m], dtype=np.float32)))[:, 1]
+    clf.fit(np.nan_to_num(scaler.transform(Xtr)), y_bag[owner[tr_m]],
+            sample_weight=instance_weights(owner[tr_m], y_bag))
+    prob = clf.predict_proba(np.nan_to_num(scaler.transform(finite(X_layer[va_m]))))[:, 1]
     if not pooled:                       # one instance per bag: the probability is the score
         order = np.argsort(owner[va_m])
         return {"mean": prob[order]}

@@ -34,7 +34,7 @@ concatenated (probe / mil: --encoder egemaps+prosody):
 
 Output (one file per participant, the layout extract.py writes, key "utt"):
     outputs/features/utterances/<pid>.json        spans, tier, prosody (written once)
-    outputs/features/windows/<set>/<pid>.npz      utt (n, layers, dim) float16,
+    outputs/features/windows/<set>/<pid>.npz      utt (n, layers, dim) float32 (encoders: float16),
                                                   utt_span (n, 2), full (layers, dim), info
 
     python -m minns.utterances --features prosody egemaps --limit 3
@@ -240,13 +240,17 @@ def read_audio(path: str) -> np.ndarray:
     return audio
 
 
-def save(name: str, pid: str, utt: np.ndarray, spans: np.ndarray, info: dict) -> None:
-    """utt (n, layers, dim) -> outputs/features/windows/<name>/<pid>.npz, extract.py's layout."""
+def save(name: str, pid: str, utt: np.ndarray, spans: np.ndarray, info: dict, dtype=np.float32) -> None:
+    """utt (n, layers, dim) -> outputs/features/windows/<name>/<pid>.npz, extract.py's layout.
+
+    Hand-made features stay float32: some eGeMAPS columns are ratios (stddevNorm =
+    sd / mean) that reach 3e4 when the mean is near 0 and overflow float16 (max 65504).
+    """
     d = WIN_DIR / name
     d.mkdir(parents=True, exist_ok=True)
     tmp = d / f"{pid}.tmp.npz"
-    np.savez(tmp, utt=utt.astype(np.float16), utt_span=spans.astype(np.float32),
-             full=utt.astype(np.float32).mean(0).astype(np.float16), info=json.dumps(info))
+    np.savez(tmp, utt=utt.astype(dtype), utt_span=spans.astype(np.float32),
+             full=utt.astype(np.float64).mean(0).astype(dtype), info=json.dumps(info))
     tmp.rename(d / f"{pid}.npz")
 
 
@@ -291,7 +295,8 @@ def encode(rows, encoder_name: str) -> None:
         for a, b in spans:
             s = min(int(a * FRAME_RATE), n_frames - 1)
             bounds.append((s, max(min(int(round(b * FRAME_RATE)), n_frames), s + 1)))
-        save(name, pid, pool_windows(hs, bounds), spans, {k: meta[k] for k in ("tier", "rule", "n_utts")})
+        save(name, pid, pool_windows(hs, bounds), spans, {k: meta[k] for k in ("tier", "rule", "n_utts")},
+             dtype=np.float16)
         if device == "mps":
             torch.mps.empty_cache()
         print(f"[{i}/{len(rows)}] {pid}  {len(spans)} utts", flush=True)
