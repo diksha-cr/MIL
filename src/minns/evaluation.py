@@ -31,6 +31,7 @@ from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedGroupKFol
 
 N_SPLITS, N_REPEATS, SEED = 5, 1, 42
 METRICS = ("auc", "ap", "f2", "f1", "ppv", "recall", "specificity", "npv")
+COUNTS = ("tp", "fn", "fp", "tn")   # confusion matrix, summed over a repeat's folds
 
 
 def cv_folds(df: pd.DataFrame, group_field: str | None = None, n_splits: int = N_SPLITS,
@@ -79,6 +80,7 @@ def compute_metrics(y_true: np.ndarray, preds: np.ndarray, prob: np.ndarray) -> 
         "recall": tp / (tp + fn) if tp + fn else 0.0,
         "specificity": tn / (tn + fp) if tn + fp else 0.0,
         "npv": tn / (tn + fn) if tn + fn else 1.0,
+        **{k: int(v) for k, v in zip(COUNTS, (tp, fn, fp, tn))},
     }
 
 
@@ -140,6 +142,8 @@ def run_cv(y: np.ndarray, folds: list[tuple[np.ndarray, np.ndarray]],
             row["site_auc"] = np.mean([within_group_auc(y, repeat_oof[m][r], sites) for r in range(n_repeats)])
         for c in (*METRICS, "thresh"):
             row[c], row[f"{c}_sd"] = pf[c].mean(), pf[c].std()
+        for c in COUNTS:                 # every participant scored once per repeat
+            row[c] = pf[c].sum() / n_repeats
         rows.append(row)
     summary = pd.DataFrame(rows).set_index("config")
     oof = {m: np.nanmean(repeat_oof[m], axis=0) for m in names}
@@ -155,4 +159,6 @@ def format_summary(summary: pd.DataFrame, sort: str = "auc", top: int | None = N
         cols.insert(1, "site_auc")
     out = s[cols].copy()
     out["auc"] = [f"{a:.3f} ± {b:.3f}" for a, b in zip(s["auc"], s["auc_sd"])]
+    if "tp" in s:
+        out["TP/FN/FP/TN"] = ["/".join(f"{s.at[i, c]:g}" for c in COUNTS) for i in s.index]
     return out.to_string(float_format=lambda v: f"{v:.3f}")
