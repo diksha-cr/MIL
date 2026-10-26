@@ -45,9 +45,12 @@ def load_bucket(bucket: str = "finetune") -> pd.DataFrame:
     return df.sort_values("participant_id").reset_index(drop=True)
 
 
-def speaker_turns(participant_id: str, rule: str = "dominant") -> tuple[list[tuple[float, float, str]],
-                                                                       list[tuple[float, float]], str | None]:
-    """(participant segments as (start, end, text), every other speaker's spans, participant tier).
+ROLES = ("participant", "interviewer", "other")
+
+
+def speaker_roles(participant_id: str, rule: str = "dominant") -> tuple[list[tuple[float, float, str, str]],
+                                                                      dict[str, str]]:
+    """(segments as (start, end, tier, text) in time order, {tier: role}) for one recording.
 
     The TextGrid tiers carry no role, so the participant has to be inferred:
 
@@ -63,16 +66,18 @@ def speaker_turns(participant_id: str, rule: str = "dominant") -> tuple[list[tup
                 ends up with the most speech. (Counting questions per tier was tried
                 and rejected: diarisation often puts a question in the wrong tier.)
 
-    Tiers ending in "?" are diarisation's unsure bucket: never the participant, but
-    still counted as "other speech". Returns ([], [], None) without a usable transcript.
+    The interviewer is the opener when that is not the participant, otherwise the
+    largest remaining tier (none in a single-speaker recording). Every other tier —
+    third speakers and diarisation's unsure "S?" bucket, which is never the
+    participant — is "other". Returns ([], {}) without a usable transcript.
     """
     path = TRANSCRIPT_DIR / f"{participant_id}.json"
     if not path.exists():
-        return [], [], None
+        return [], {}
     try:
         segments = (json.loads(path.read_text()).get("transcript") or {}).get("segments") or []
     except json.JSONDecodeError:
-        return [], [], None
+        return [], {}
     segs = sorted(((float(s.get("start_sec") or 0.0), float(s.get("end_sec") or 0.0),
                     str(s.get("speaker_id") or ""), str(s.get("text") or "")) for s in segments),
                   key=lambda s: s[0])
@@ -83,22 +88,37 @@ def speaker_turns(participant_id: str, rule: str = "dominant") -> tuple[list[tup
         if not tier.endswith("?"):
             durations[tier] += b - a
     if not durations:
-        return [], [], None
+        return [], {}
 
+    opener = next((t for _, _, t, text in segs if t in durations and len(text.split()) >= OPENER_WORDS),
+                  next(t for _, _, t, _ in segs if t in durations))
     if rule == "dominant" or len(durations) == 1:
-        tier = max(durations, key=durations.get)
+        participant = max(durations, key=durations.get)
     elif rule == "role":
-        opener = next((t for _, _, t, text in segs if t in durations and len(text.split()) >= OPENER_WORDS),
-                      next(t for _, _, t, _ in segs if t in durations))
         if durations[opener] >= MONOLOGUE_SHARE * sum(durations.values()):
-            tier = opener                    # read the prompt themselves and kept talking
+            participant = opener             # read the prompt themselves and kept talking
         else:
-            tier = max((t for t in durations if t != opener), key=durations.get)
+            participant = max((t for t in durations if t != opener), key=durations.get)
     else:
         raise ValueError(f"unknown speaker rule {rule!r}")
+    rest = [t for t in durations if t != participant]
+    interviewer = opener if opener != participant else max(rest, key=durations.get, default=None)
+    roles = {t: "participant" if t == participant else "interviewer" if t == interviewer else "other"
+             for t in {s[2] for s in segs}}
+    return segs, roles
 
-    mine = [(a, b, text) for a, b, t, text in segs if t == tier]
-    others = [(a, b) for a, b, t, _ in segs if t != tier]
+
+def speaker_turns(participant_id: str, rule: str = "dominant", role: str = "participant"
+                  ) -> tuple[list[tuple[float, float, str]], list[tuple[float, float]], str | None]:
+    """(segments of `role` as (start, end, text), every other speaker's spans, the role's tier).
+
+    See speaker_roles for how roles are assigned. For "other" the tier is None (it can
+    be several). Returns ([], [], None) without a usable transcript.
+    """
+    segs, roles = speaker_roles(participant_id, rule)
+    mine = [(a, b, text) for a, b, t, text in segs if roles[t] == role]
+    others = [(a, b) for a, b, t, _ in segs if roles[t] != role]
+    tier = next((t for t, r in roles.items() if r == role), None) if role != "other" else None
     return mine, others, tier
 
 

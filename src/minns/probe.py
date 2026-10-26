@@ -15,6 +15,11 @@ For every encoder layer and window size:
                    Alsarrani et al. 2025, kept to show how it behaves at 11 %).
   full           the same regression on one mean-pooled embedding per
                  participant (the pipeline's representation, at every layer).
+  dlg            dialogue utterances (minns.utterances): every speaker's utterances
+                 in the bag. Besides the pools above over all of them, mean / max /
+                 p90 over each role alone: mean@P (participant), mean@I (interviewer),
+                 ... A bag without interviewer utterances uses its all-utterance value.
+                 Give the regression the roles too with +role in --encoder.
 
 Config names read  <encoder>|<window>|L<layer>|<pooling>, e.g. whisper-medium|w5|L18|mm10.
 
@@ -46,8 +51,9 @@ POOL_OMEGAS = (-10, -1, 1, 10, 100)
 # ── packed, layer-major feature cache ─────────────────────────────────────────
 
 def window_key(w: str) -> str:
-    """CLI window -> npz key: "full", "utt" (utterances, minns.utterances) or "w<sec>"."""
-    return w if w in ("full", "utt") else f"w{float(w):g}"
+    """CLI window -> npz key: "full", "utt" / "dlg" (participant / dialogue utterances,
+    minns.utterances) or "w<sec>"."""
+    return w if w in ("full", "utt", "dlg") else f"w{float(w):g}"
 
 
 def load_packed(encoder: str, key: str, pids: list[str]) -> tuple[np.ndarray, np.ndarray]:
@@ -110,15 +116,33 @@ def load_packed(encoder: str, key: str, pids: list[str]) -> tuple[np.ndarray, np
 
 # ── pooling of window probabilities ───────────────────────────────────────────
 
-def pool_scores(prob: np.ndarray, owner: np.ndarray, bags: np.ndarray) -> dict[str, np.ndarray]:
-    """Pool window probabilities into one score per bag, for every pooling rule."""
-    out = {k: np.empty(len(bags)) for k in ("mean", "max", "min", "p90", "vote", *[f"mm{w}" for w in POOL_OMEGAS])}
+ROLE_POOLS = {"P": 0, "I": 1}           # data.ROLES indices pooled on their own for dialogue bags
+
+
+def pool_scores(prob: np.ndarray, owner: np.ndarray, bags: np.ndarray,
+                roles: np.ndarray | None = None) -> dict[str, np.ndarray]:
+    """Pool window probabilities into one score per bag, for every pooling rule.
+
+    With `roles` (one data.ROLES index per instance) also mean / max / p90 over each
+    ROLE_POOLS role alone; a bag without that role falls back to its all-instance value.
+    """
+    names = ["mean", "max", "min", "p90", "vote", *[f"mm{w}" for w in POOL_OMEGAS]]
+    if roles is not None:
+        names += [f"{k}@{tag}" for tag in ROLE_POOLS for k in ("mean", "max", "p90")]
+    out = {k: np.empty(len(bags)) for k in names}
     order = np.argsort(owner, kind="stable")
     owner_s, prob_s = owner[order], prob[order]
+    roles_s = roles[order] if roles is not None else None
     starts = np.searchsorted(owner_s, bags, side="left")
     ends = np.searchsorted(owner_s, bags, side="right")
     for i, (s, e) in enumerate(zip(starts, ends)):
         p = prob_s[s:e]
+        if roles_s is not None:
+            for tag, r in ROLE_POOLS.items():
+                q = p[roles_s[s:e] == r]
+                q = q if len(q) else p
+                out[f"mean@{tag}"][i], out[f"max@{tag}"][i] = q.mean(), q.max()
+                out[f"p90@{tag}"][i] = np.quantile(q, 0.9)
         out["mean"][i], out["max"][i], out["min"][i] = p.mean(), p.max(), p.min()
         out["p90"][i] = np.quantile(p, 0.9)
         out["vote"][i] = (p > 0.5).mean()
@@ -147,7 +171,8 @@ def instance_weights(owner: np.ndarray, y_bag: np.ndarray) -> np.ndarray:
 
 
 def fit_layer(X_layer: np.ndarray, owner: np.ndarray, y_bag: np.ndarray,
-              tr_bags: np.ndarray, va_bags: np.ndarray, C: float, pooled: bool) -> dict[str, np.ndarray]:
+              tr_bags: np.ndarray, va_bags: np.ndarray, C: float, pooled: bool,
+              roles: np.ndarray | None = None) -> dict[str, np.ndarray]:
     tr_m, va_m = np.isin(owner, tr_bags), np.isin(owner, va_bags)
     Xtr = finite(X_layer[tr_m])
     scaler = StandardScaler().fit(Xtr)                 # ignores NaN when fitting
@@ -158,7 +183,7 @@ def fit_layer(X_layer: np.ndarray, owner: np.ndarray, y_bag: np.ndarray,
     if not pooled:                       # one instance per bag: the probability is the score
         order = np.argsort(owner[va_m])
         return {"mean": prob[order]}
-    return pool_scores(prob, owner[va_m], np.sort(va_bags))
+    return pool_scores(prob, owner[va_m], np.sort(va_bags), None if roles is None else roles[va_m])
 
 
 def main() -> None:
@@ -184,6 +209,12 @@ def main() -> None:
 
     keys = [window_key(w) for w in args.windows]
     data = {k: load_packed(args.encoder, k, pids) for k in keys}
+    roles = {}
+    if "dlg" in data:                  # speaker role of every dialogue utterance, for per-role pooling
+        onehot, owner = load_packed("role", "dlg", pids)
+        if not np.array_equal(owner, data["dlg"][1]):
+            raise SystemExit("role and feature sets have different dialogue utterances; re-run minns.utterances")
+        roles["dlg"] = np.asarray(onehot[0], dtype=np.float32).argmax(1)
     n_layers = next(iter(data.values()))[0].shape[0]
     layers = list(range(n_layers)) if args.layers == ["all"] else [int(l) for l in args.layers]
     if not all(0 <= l < n_layers for l in layers):
@@ -197,7 +228,8 @@ def main() -> None:
         back = np.argsort(np.argsort(va_bags))
         jobs = [(k, l) for k in keys for l in layers]
         results = Parallel(n_jobs=args.jobs)(
-            delayed(fit_layer)(data[k][0][l], data[k][1], y_bag, tr_bags, va_bags, args.C, k != "full")
+            delayed(fit_layer)(data[k][0][l], data[k][1], y_bag, tr_bags, va_bags, args.C, k != "full",
+                               roles.get(k))
             for k, l in jobs)
         out = {}
         for (k, l), res in zip(jobs, results):

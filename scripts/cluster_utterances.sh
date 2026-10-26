@@ -12,9 +12,11 @@
 # (e.g. after changing a constant in minns/utterances.py) needs UTT_ARGS=--overwrite
 # on step 1 AND step 2, so every feature set keeps the same utterances.
 #
-# Then probe / MIL on them like any other encoder, with --windows utt:
-#   PROBE_ARGS="--windows utt full" sbatch scripts/cluster_probe.sh egemaps+prosody random
-#   uv run python -m minns.mil --encoder egemaps+prosody --windows utt --layers 0
+# Two instance sets: utt (participant only) and dlg (whole dialogue, every utterance
+# tagged participant / interviewer / other in the `role` set). Probe / MIL on them like
+# any other encoder; with dlg add +role so the model knows who is speaking:
+#   PROBE_ARGS="--windows dlg utt" sbatch scripts/cluster_probe.sh egemaps+prosody+role random
+#   uv run python -m minns.mil --encoder whisper-medium-utt+prosody+role --windows dlg --layers 23 24
 #
 # Optional env: UTT_ARGS (extra minns.utterances flags, e.g. "--limit 3" or "--rule dominant"),
 #               DATA_DIR / MH_PIPELINE_ROOT and MINNS_OUTPUTS as in cluster_extract.sh.
@@ -44,7 +46,7 @@ case "$MODE" in
     JOBS="${SLURM_CPUS_PER_TASK:-$(nproc)}"
     # shellcheck disable=SC2086
     uv run --frozen python -m minns.utterances --features prosody egemaps --jobs "$JOBS" ${UTT_ARGS:-}
-    bash "$0" check prosody && bash "$0" check egemaps
+    bash "$0" check prosody && bash "$0" check egemaps && bash "$0" check role
     ;;
 
   check)
@@ -55,7 +57,7 @@ import numpy as np
 from minns.data import OUTPUTS, load_bucket
 d = OUTPUTS / "features/windows" / os.environ["SET"]
 df = load_bucket("finetune")
-missing, bad, n_utts, fallback, shapes = [], [], [], 0, set()
+missing, bad, n_utts, n_dlg, fallback, shapes = [], [], [], [], 0, set()
 for pid in df.participant_id:
     f = d / f"{pid}.npz"
     if not f.exists():
@@ -64,13 +66,17 @@ for pid in df.participant_id:
     u = z["utt"].astype(np.float32)
     shapes.add(u.shape[1:])
     n_utts.append(len(u))
-    if not np.isfinite(u).all():
+    if "dlg" not in z.files:
+        bad.append(pid + " (no dlg: segmented before role tagging)"); continue
+    n_dlg.append(len(z["dlg"]))
+    if not np.isfinite(u).all() or not np.isfinite(z["dlg"].astype(np.float32)).all():
         bad.append(pid)
     fallback += bool(json.loads(str(z["info"])).get("fallback"))
 print(f"{d.name}: {len(df) - len(missing)}/{len(df)} done, {len(bad)} with NaN/inf, "
       f"{fallback} fallback bags, (layers, dim) {shapes}")
 if n_utts:
-    print("utterances per participant p10/50/90:", np.percentile(n_utts, [10, 50, 90]).tolist())
+    print("participant utterances p10/50/90:", np.percentile(n_utts, [10, 50, 90]).tolist(),
+          "  dialogue utterances p10/50/90:", np.percentile(n_dlg, [10, 50, 90]).tolist() if n_dlg else "-")
 print("missing:", missing[:10], "bad:", bad[:10])
 raise SystemExit(1 if missing or bad else 0)
 EOF

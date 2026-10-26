@@ -1,14 +1,20 @@
-"""Stage D: utterance instances — the participant's own speech cut at pauses.
+"""Stage D: utterance instances — speech cut at pauses, every utterance tagged with its speaker's role.
 
-Instead of fixed 2-20 s windows, every instance is one utterance: a stretch of the
-participant's speech bounded by pauses. Each participant is still a bag.
+Instead of fixed 2-20 s windows, every instance is one utterance: a stretch of one
+speaker's speech bounded by pauses. Each participant (recording) is still a bag.
+Two instance sets per recording:
 
-Segmentation, per participant:
-  1. Participant vs interviewer from the TextGrid tiers (data.speaker_turns,
-     rule "role" by default — see there).
-  2. A 10 ms frame is speech when it lies in a participant segment, in no other
-     speaker's segment, and its energy is above the recording's silence threshold
-     (SILENCE_FRAC of the way from the 10th to the 95th energy percentile, in dB).
+  utt   the participant's own utterances only.
+  dlg   the whole dialogue: participant, interviewer and "other" utterances
+        (third speakers, diarisation's unsure tier) in time order. Which is which
+        is in the `role` feature set (one-hot ROLES); add it with +role.
+
+Segmentation, per recording and per role:
+  1. Roles from the TextGrid tiers (data.speaker_roles, rule "role" by default).
+  2. A 10 ms frame is speech of a role when it lies in one of that role's segments,
+     in no other speaker's segment (overlapped speech is nobody's), and its energy
+     is above the recording's silence threshold (SILENCE_FRAC of the way from the
+     10th to the 95th energy percentile, in dB).
   3. Speech runs separated by a silence shorter than PAUSE_SEC are joined
      (never across another speaker's turn). The result is one utterance per run.
   4. Utterances longer than MAX_SEC are split at their longest internal pause
@@ -16,7 +22,7 @@ Segmentation, per participant:
      are dropped.
 
 Feature sets, one per output folder, all on the same utterances so they can be
-concatenated (probe / mil: --encoder egemaps+prosody):
+concatenated (probe / mil: --encoder egemaps+prosody+role):
 
   prosody          PROSODY_NAMES — timing and pitch measured directly:
                    speaking rate (syllables per second of the transcribed segments,
@@ -30,17 +36,19 @@ concatenated (probe / mil: --encoder egemaps+prosody):
                    loudness level and spread, voiced share.
   egemaps          openSMILE eGeMAPSv02 functionals (88-D) of the utterance audio:
                    pitch, loudness, jitter, shimmer, HNR, formants, spectral balance.
+  role             one-hot speaker role (participant, interviewer, other).
   <encoder>-utt    a speech encoder's hidden states (every layer), run once over
                    the full recording as in extract.py, mean-pooled over the utterance.
 
-Output (one file per participant, the layout extract.py writes, key "utt"):
-    outputs/features/utterances/<pid>.json        spans, tier, prosody (written once)
-    outputs/features/windows/<set>/<pid>.npz      utt (n, layers, dim) float32 (encoders: float16),
-                                                  utt_span (n, 2), full (layers, dim), info
+Output (one file per participant, the layout extract.py writes, keys "utt" and "dlg"):
+    outputs/features/utterances/<pid>.json        spans, roles (written once, reused by encoders)
+    outputs/features/windows/<set>/<pid>.npz      utt / dlg (n, layers, dim) float32 (encoders:
+                                                  float16), utt_span / dlg_span (n, 2),
+                                                  full (layers, dim, participant mean), info
 
     python -m minns.utterances --features prosody egemaps --limit 3
     python -m minns.utterances --features whisper-medium          # GPU; reuses the spans
-    python -m minns.probe --encoder egemaps+prosody --windows utt
+    python -m minns.probe --encoder egemaps+prosody+role --windows dlg utt
 """
 from __future__ import annotations
 
@@ -54,7 +62,7 @@ import numpy as np
 import soundfile as sf
 from joblib import Parallel, delayed
 
-from minns.data import OUTPUTS, SAMPLE_RATE, load_bucket, speaker_turns
+from minns.data import OUTPUTS, ROLES, SAMPLE_RATE, load_bucket, speaker_roles
 
 HOP = 0.01                 # frame step, seconds (also openSMILE's LLD step)
 WIN = 0.025                # energy frame length, seconds
@@ -129,14 +137,19 @@ def split_long(s: int, e: int, speech: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(edges[:-1], edges[1:]))
 
 
-def segment(audio: np.ndarray, mine, others) -> tuple[list[tuple[int, int]], np.ndarray, np.ndarray]:
-    """Utterance frame ranges, plus the frame-level speech mask and other-speaker mask."""
+def segment(audio: np.ndarray, mine, others, fallback: bool = True
+            ) -> tuple[list[tuple[int, int]], np.ndarray, np.ndarray]:
+    """Utterance frame ranges of `mine`, plus the frame-level speech mask and other-speaker mask.
+
+    fallback=True (the participant) never returns an empty list, see below; without
+    it (interviewer, other) a speaker with no usable speech simply has no utterances.
+    """
     db = frame_db(audio)
     n = len(db)
     lo, hi = np.percentile(db, [10, 95])
     loud = db > lo + SILENCE_FRAC * (hi - lo)
     other = span_mask(others, n)
-    mine_m = span_mask(mine, n) if mine else np.ones(n, bool)   # no transcript: all of it
+    mine_m = span_mask(mine, n) if mine or not fallback else np.ones(n, bool)   # no transcript: all of it
     speech = loud & mine_m & ~other
 
     utts, cur = [], None
@@ -151,6 +164,8 @@ def segment(audio: np.ndarray, mine, others) -> tuple[list[tuple[int, int]], np.
         utts.append(cur)
     utts = [p for s, e in utts for p in split_long(s, e, speech)]
     kept = [(s, e) for s, e in utts if speech[s:e].sum() * HOP >= MIN_SPEECH_SEC]
+    if not fallback:
+        return kept, speech, other
     # Never an empty bag (near-silent audio or a transcript with almost nothing for
     # the participant): fall back to the longest run, then the participant's own
     # segments as transcribed, then the whole recording. build() records which.
@@ -243,8 +258,10 @@ def read_audio(path: str) -> np.ndarray:
     return audio
 
 
-def save(name: str, pid: str, utt: np.ndarray, spans: np.ndarray, info: dict, dtype=np.float32) -> None:
-    """utt (n, layers, dim) -> outputs/features/windows/<name>/<pid>.npz, extract.py's layout.
+def save(name: str, pid: str, sets: dict[str, tuple[np.ndarray, np.ndarray]], info: dict,
+         dtype=np.float32) -> None:
+    """{key: (features (n, layers, dim), spans (n, 2))} -> outputs/features/windows/<name>/<pid>.npz,
+    extract.py's layout; `full` is the mean over the participant's utterances.
 
     Hand-made features stay float32: some eGeMAPS columns are ratios (stddevNorm =
     sd / mean) that reach 3e4 when the mean is near 0 and overflow float16 (max 65504).
@@ -252,35 +269,68 @@ def save(name: str, pid: str, utt: np.ndarray, spans: np.ndarray, info: dict, dt
     d = WIN_DIR / name
     d.mkdir(parents=True, exist_ok=True)
     tmp = d / f"{pid}.tmp.npz"
-    np.savez(tmp, utt=utt.astype(dtype), utt_span=spans.astype(np.float32),
-             full=utt.astype(np.float64).mean(0).astype(dtype), info=json.dumps(info))
+    arrays = {}
+    for key, (feats, spans) in sets.items():
+        arrays[key] = feats.astype(dtype)
+        arrays[f"{key}_span"] = spans.astype(np.float32)
+    arrays["full"] = sets["utt"][0].astype(np.float64).mean(0).astype(dtype)
+    np.savez(tmp, info=json.dumps(info), **arrays)
     tmp.rename(d / f"{pid}.npz")
 
 
 def build(pid: str, audio_path: str, rule: str, egemaps: bool) -> str:
-    """Segment one participant, write its spans + prosody (and eGeMAPS). Returns a log line."""
+    """Segment one recording by role, write its spans, prosody, roles (and eGeMAPS). Returns a log line."""
     audio = read_audio(audio_path)
-    mine, others, tier = speaker_turns(pid, rule)
-    utts, speech, other = segment(audio, mine, others)
-    f0, loud = lld_frames(audio, len(speech))
-    pros = prosody(utts, speech, other, mine, f0, loud)
-    spans = np.asarray(utts, dtype=np.float32) * HOP
-    kept_speech = sum(int(speech[s:e].sum()) for s, e in utts) * HOP
-    info = {"tier": tier, "rule": rule, "has_transcript": bool(mine), "n_utts": len(utts),
-            "fallback": kept_speech < MIN_SPEECH_SEC * len(utts),
+    segs, roles = speaker_roles(pid, rule)
+    f0 = loud = None
+    utts, pros, role_idx, part = [], [], [], {}
+    for r, name in enumerate(ROLES):
+        mine = [(a, b, text) for a, b, t, text in segs if roles[t] == name]
+        others = [(a, b) for a, b, t, _ in segs if roles[t] != name]
+        if name != "participant" and not mine:
+            continue
+        u, speech, other = segment(audio, mine, others, fallback=name == "participant")
+        if f0 is None:
+            f0, loud = lld_frames(audio, len(speech))
+        if name == "participant":
+            part = {"speech": speech, "utts": u, "mine": mine}
+        if u:
+            utts += u
+            pros.append(prosody(u, speech, other, mine, f0, loud))
+            role_idx += [r] * len(u)
+    order = np.argsort([s for s, _ in utts], kind="stable")
+    spans = (np.asarray(utts, dtype=np.float32) * HOP)[order]
+    pros = np.concatenate(pros)[order]
+    role_idx = np.asarray(role_idx)[order]
+    is_p = role_idx == 0
+    onehot = np.eye(len(ROLES), dtype=np.float32)[role_idx]
+
+    speech = part["speech"]
+    kept_speech = sum(int(speech[s:e].sum()) for s, e in part["utts"]) * HOP
+    info = {"tier": next((t for t, r in roles.items() if r == "participant"), None), "roles": roles,
+            "rule": rule, "has_transcript": bool(part["mine"]), "n_utts": int(is_p.sum()),
+            "n_dlg": {name: int((role_idx == r).sum()) for r, name in enumerate(ROLES)},
+            "fallback": kept_speech < MIN_SPEECH_SEC * int(is_p.sum()),
             "speech_sec": float(speech.sum() * HOP), "kept_sec": float(kept_speech),
             "total_sec": len(audio) / SAMPLE_RATE}
     UTT_DIR.mkdir(parents=True, exist_ok=True)
-    (UTT_DIR / f"{pid}.json").write_text(json.dumps({**info, "spans": spans.tolist(),
+    (UTT_DIR / f"{pid}.json").write_text(json.dumps({**info, "spans": spans[is_p].tolist(),
+                                                     "dlg_spans": spans.tolist(), "dlg_roles": role_idx.tolist(),
                                                      "prosody_names": PROSODY_NAMES}))
-    save("prosody", pid, pros[:, None, :], spans, {**info, "names": PROSODY_NAMES})
+
+    def both(feats):                    # dialogue set and its participant subset
+        return {"utt": (feats[is_p], spans[is_p]), "dlg": (feats, spans)}
+
+    save("prosody", pid, both(pros[:, None, :]), {**info, "names": PROSODY_NAMES})
+    save("role", pid, both(onehot[:, None, :]), {**info, "names": ROLES})
     if egemaps:
         import opensmile
         smile = opensmile.Smile(opensmile.FeatureSet.eGeMAPSv02, opensmile.FeatureLevel.Functionals)
         feats = np.stack([smile.process_signal(audio[int(a * SAMPLE_RATE):int(b * SAMPLE_RATE)],
                                                SAMPLE_RATE).to_numpy()[0] for a, b in spans])
-        save("egemaps", pid, feats[:, None, :], spans, info)
-    return f"{pid}  tier={tier}  {len(utts)} utts  {info['speech_sec']:.0f}/{info['total_sec']:.0f}s speech"
+        save("egemaps", pid, both(feats[:, None, :]), info)
+    return (f"{pid}  participant={info['tier']}  " + " ".join(f"{k}:{v}" for k, v in info["n_dlg"].items())
+            + f" utts  {info['speech_sec']:.0f}/{info['total_sec']:.0f}s participant speech")
 
 
 def encode(rows, encoder_name: str) -> None:
@@ -292,17 +342,21 @@ def encode(rows, encoder_name: str) -> None:
     name = f"{encoder_name}-utt"
     for i, (pid, path) in enumerate(rows, 1):
         meta = json.loads((UTT_DIR / f"{pid}.json").read_text())
-        spans = np.asarray(meta["spans"], dtype=np.float32)
+        if "dlg_spans" not in meta:
+            raise SystemExit(f"{pid}: segmented before role tagging; re-run --features prosody egemaps --overwrite")
+        spans = np.asarray(meta["dlg_spans"], dtype=np.float32)
+        is_p = np.asarray(meta["dlg_roles"]) == 0
         hs = enc(read_audio(path))
         n_frames, bounds = hs.shape[1], []
         for a, b in spans:
             s = min(int(a * FRAME_RATE), n_frames - 1)
             bounds.append((s, max(min(int(round(b * FRAME_RATE)), n_frames), s + 1)))
-        save(name, pid, pool_windows(hs, bounds), spans, {k: meta[k] for k in ("tier", "rule", "n_utts")},
-             dtype=np.float16)
+        feats = pool_windows(hs, bounds)
+        save(name, pid, {"utt": (feats[is_p], spans[is_p]), "dlg": (feats, spans)},
+             {k: meta[k] for k in ("tier", "rule", "n_utts", "n_dlg")}, dtype=np.float16)
         if device == "mps":
             torch.mps.empty_cache()
-        print(f"[{i}/{len(rows)}] {pid}  {len(spans)} utts", flush=True)
+        print(f"[{i}/{len(rows)}] {pid}  {len(spans)} utterances, {int(is_p.sum())} participant", flush=True)
 
 
 def main() -> None:

@@ -217,7 +217,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--encoder", required=True)
     ap.add_argument("--windows", nargs="+", default=["2", "5"],
-                    help="window sizes in seconds, or 'utt' (utterances, from minns.utterances)")
+                    help="window sizes in seconds, or 'utt' / 'dlg' (participant / dialogue utterances, "
+                         "from minns.utterances; add +role to --encoder so the network sees who speaks)")
     ap.add_argument("--layers", nargs="+", type=int, required=True)
     ap.add_argument("--models", nargs="+", default=list(MODELS), choices=MODELS + LINEAR_MODELS)
     ap.add_argument("--C", type=float, default=0.01, help="inverse L2 strength of the lin-* models (as in the probe)")
