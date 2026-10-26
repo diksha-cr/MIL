@@ -29,6 +29,8 @@ BUCKETS = {
 }
 TRANSCRIPT_DIR = PIPELINE_ROOT / "outputs/features/text/participant_jsons"
 SAMPLE_RATE = 16000
+OPENER_WORDS = 3          # speaker_turns(rule="role"): shortest segment that counts as the prompt
+MONOLOGUE_SHARE = 0.75
 
 
 def load_bucket(bucket: str = "finetune") -> pd.DataFrame:
@@ -43,34 +45,67 @@ def load_bucket(bucket: str = "finetune") -> pd.DataFrame:
     return df.sort_values("participant_id").reset_index(drop=True)
 
 
-def participant_spans(participant_id: str) -> tuple[list[tuple[float, float]], str | None]:
-    """The participant's own speech spans: the diarisation tier with the most speech.
+def speaker_turns(participant_id: str, rule: str = "dominant") -> tuple[list[tuple[float, float, str]],
+                                                                       list[tuple[float, float]], str | None]:
+    """(participant segments as (start, end, text), every other speaker's spans, participant tier).
 
-    Same rule as mh-ML-pipeline's src/speech/extract_features.participant_segments,
-    so "participant audio" means the same thing in both repos. Tiers ending in "?"
-    are diarisation's unsure bucket and are ignored. Returns ([], None) when there
-    is no usable transcript.
+    The TextGrid tiers carry no role, so the participant has to be inferred:
+
+      dominant  the tier with the most speech. Same rule as mh-ML-pipeline's
+                src/speech/extract_features.participant_segments, so "participant
+                audio" means the same thing in both repos.
+      role      the tier of the first segment of at least OPENER_WORDS words reads
+                the prompt, so it is the interviewer and the participant is the
+                largest other tier — unless that opener holds MONOLOGUE_SHARE of all
+                speech, i.e. the participant read the prompt themselves and kept
+                talking. Differs from `dominant` on about a third of recordings,
+                mostly ones where the interviewer keeps asking follow-up questions and
+                ends up with the most speech. (Counting questions per tier was tried
+                and rejected: diarisation often puts a question in the wrong tier.)
+
+    Tiers ending in "?" are diarisation's unsure bucket: never the participant, but
+    still counted as "other speech". Returns ([], [], None) without a usable transcript.
     """
     path = TRANSCRIPT_DIR / f"{participant_id}.json"
     if not path.exists():
-        return [], None
+        return [], [], None
     try:
         segments = (json.loads(path.read_text()).get("transcript") or {}).get("segments") or []
     except json.JSONDecodeError:
-        return [], None
+        return [], [], None
+    segs = sorted(((float(s.get("start_sec") or 0.0), float(s.get("end_sec") or 0.0),
+                    str(s.get("speaker_id") or ""), str(s.get("text") or "")) for s in segments),
+                  key=lambda s: s[0])
+    segs = [s for s in segs if s[1] > s[0] and s[2]]
 
     durations: dict[str, float] = collections.defaultdict(float)
-    for seg in segments:
-        tier = str(seg.get("speaker_id") or "")
-        if tier and not tier.endswith("?"):
-            durations[tier] += float(seg.get("duration_sec") or 0.0)
+    for a, b, tier, text in segs:
+        if not tier.endswith("?"):
+            durations[tier] += b - a
     if not durations:
-        return [], None
+        return [], [], None
 
-    tier = max(durations, key=durations.get)
-    spans = [(float(s.get("start_sec") or 0.0), float(s.get("end_sec") or 0.0))
-             for s in segments if str(s.get("speaker_id") or "") == tier]
-    return sorted((a, b) for a, b in spans if b > a), tier
+    if rule == "dominant" or len(durations) == 1:
+        tier = max(durations, key=durations.get)
+    elif rule == "role":
+        opener = next((t for _, _, t, text in segs if t in durations and len(text.split()) >= OPENER_WORDS),
+                      next(t for _, _, t, _ in segs if t in durations))
+        if durations[opener] >= MONOLOGUE_SHARE * sum(durations.values()):
+            tier = opener                    # read the prompt themselves and kept talking
+        else:
+            tier = max((t for t in durations if t != opener), key=durations.get)
+    else:
+        raise ValueError(f"unknown speaker rule {rule!r}")
+
+    mine = [(a, b, text) for a, b, t, text in segs if t == tier]
+    others = [(a, b) for a, b, t, _ in segs if t != tier]
+    return mine, others, tier
+
+
+def participant_spans(participant_id: str, rule: str = "dominant") -> tuple[list[tuple[float, float]], str | None]:
+    """The participant's own speech spans under `rule` (see speaker_turns). ([], None) without a transcript."""
+    mine, _, tier = speaker_turns(participant_id, rule)
+    return [(a, b) for a, b, _ in mine], tier
 
 
 def load_audio(row, diarise: bool = False) -> tuple[np.ndarray, dict]:

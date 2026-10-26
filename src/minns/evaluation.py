@@ -150,7 +150,7 @@ def format_summary(summary: pd.DataFrame, sort: str = "auc", top: int | None = N
     s = summary.sort_values(sort, ascending=False)
     if top:
         s = s.head(top)
-    cols = ["oof_auc", "auc", "ap", "f2", "ppv", "recall", "specificity", "npv"]
+    cols = ["oof_auc", "auc", "ap", "f2", "f1", "ppv", "recall", "specificity", "npv"]
     if "site_auc" in s:
         cols.insert(1, "site_auc")
     out = s[cols].copy()

@@ -1,5 +1,7 @@
 """Stage B: layer x window x pooling probe (de Gennes et al. 2024) on our cohort.
 
+what exactly is the probe.py doing? is it following the de genne's paper which is based on the 2 hyperamaters choosing or the the other paper which uses MINN and then does MIL based on the max pooling.
+
 For every encoder layer and window size:
 
   window probe   a balanced logistic regression trained on WINDOWS, each window
@@ -43,13 +45,32 @@ POOL_OMEGAS = (-10, -1, 1, 10, 100)
 
 # ── packed, layer-major feature cache ─────────────────────────────────────────
 
+def window_key(w: str) -> str:
+    """CLI window -> npz key: "full", "utt" (utterances, minns.utterances) or "w<sec>"."""
+    return w if w in ("full", "utt") else f"w{float(w):g}"
+
+
 def load_packed(encoder: str, key: str, pids: list[str]) -> tuple[np.ndarray, np.ndarray]:
     """(features (L, N, D) float16 memmap, owner (N,) row index into `pids`).
 
     The per-participant npz files are repacked once per (encoder, key) into a
-    layer-major .npy so a single layer is one contiguous read. `key` is "full" or
-    "w<sec>". Rebuilt automatically if the participant list changes.
+    layer-major .npy so a single layer is one contiguous read. `key` is "full",
+    "utt" or "w<sec>". Rebuilt automatically if the participant list changes.
+
+    "a+b" concatenates feature sets along the feature axis, e.g. egemaps+prosody
+    or whisper-medium-utt+prosody. They must share their instances (the utterance
+    sets do); a single-layer set is repeated across the other set's layers.
     """
+    if "+" in encoder:
+        parts = [load_packed(e, key, pids) for e in encoder.split("+")]
+        owner = parts[0][1]
+        if any(not np.array_equal(o, owner) for _, o in parts[1:]):
+            raise SystemExit(f"{encoder}: the feature sets do not have the same instances for {key}")
+        n_layers = max(f.shape[0] for f, _ in parts)
+        if any(f.shape[0] not in (1, n_layers) for f, _ in parts):
+            raise SystemExit(f"{encoder}: layer counts {[f.shape[0] for f, _ in parts]} cannot be combined")
+        return np.concatenate([np.broadcast_to(f, (n_layers, *f.shape[1:])) for f, _ in parts], axis=2), owner
+
     src = OUTPUTS / "features/windows" / encoder
     dst = OUTPUTS / "features/packed" / encoder
     dst.mkdir(parents=True, exist_ok=True)
@@ -131,7 +152,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--encoder", required=True)
     ap.add_argument("--windows", nargs="+", default=["full", "2", "5", "10", "20"],
-                    help="window sizes in seconds, and/or 'full' (one mean embedding per participant)")
+                    help="window sizes in seconds, 'full' (one mean embedding per participant) "
+                         "and/or 'utt' (utterances, from minns.utterances)")
     ap.add_argument("--layers", nargs="+", default=["all"])
     ap.add_argument("--C", type=float, default=0.01, help="inverse L2 strength of every probe")
     ap.add_argument("--cv", choices=["random", "site"], default="random")
@@ -147,10 +169,12 @@ def main() -> None:
     y = y_bag[train_rows]
     folds = cv_folds(train, group_field="meta_site" if args.cv == "site" else None)
 
-    keys = ["full" if w == "full" else f"w{float(w):g}" for w in args.windows]
+    keys = [window_key(w) for w in args.windows]
     data = {k: load_packed(args.encoder, k, pids) for k in keys}
     n_layers = next(iter(data.values()))[0].shape[0]
     layers = list(range(n_layers)) if args.layers == ["all"] else [int(l) for l in args.layers]
+    if not all(0 <= l < n_layers for l in layers):
+        raise SystemExit(f"{args.encoder} has layers 0..{n_layers - 1}; asked for {layers}")
     print(f"{args.encoder}: windows {keys}, layers {layers[0]}..{layers[-1]} ({len(layers)}), C={args.C}, "
           f"{args.cv} CV, {len(folds)} folds, train {len(y)} ({y.sum()} positive)")
 

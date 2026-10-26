@@ -69,20 +69,25 @@ def build_blocks(df: pd.DataFrame) -> dict[str, tuple[np.ndarray, callable]]:
 
     demog = np.column_stack([df["meta_gender"], df["meta_age"], df["meta_education"]]).astype(float)
 
-    z = np.load(PIPELINE_ROOT / "outputs/features/speech/whisper_finetune674.npz", allow_pickle=True)
+    scaled = lambda C=1.0: make_pipeline(StandardScaler(), logreg(C))
+    blocks = {
+        "confound:site+language": (onehot(["meta_site", "meta_language"]), lambda: logreg(1.0)),
+        "confound:demographics": (demog, scaled),
+        "quality:audio": (quality, scaled),
+    }
+
+    path = PIPELINE_ROOT / "outputs/features/speech/whisper_finetune674.npz"
+    if not path.exists():
+        print(f"skipping pipeline:whisper-L23 — {path} not found")
+        return blocks
+    z = np.load(path, allow_pickle=True)
     lookup = dict(zip(z["participant_ids"].astype(str), z["layer_0"]))
     missing = [p for p in df["participant_id"] if p not in lookup]
     if missing:
         raise SystemExit(f"{len(missing)} train participants missing from whisper_finetune674.npz")
     whisper = np.stack([lookup[p] for p in df["participant_id"]]).astype(np.float32)
-
-    scaled = lambda C=1.0: make_pipeline(StandardScaler(), logreg(C))
-    return {
-        "confound:site+language": (onehot(["meta_site", "meta_language"]), lambda: logreg(1.0)),
-        "confound:demographics": (demog, scaled),
-        "quality:audio": (quality, scaled),
-        "pipeline:whisper-L23": (whisper, lambda: nested_logreg(pca=0.90)),
-    }
+    blocks["pipeline:whisper-L23"] = (whisper, lambda: nested_logreg(pca=0.90))
+    return blocks
 
 
 def main() -> None:

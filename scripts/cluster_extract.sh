@@ -5,18 +5,24 @@
 # participants that already have an .npz are skipped, so just resubmit after a timeout.
 #
 #   1. On the LOGIN node (needs internet), once:
-#        MH_PIPELINE_ROOT=/path/to/mh-data bash scripts/cluster_extract.sh setup
-#   2. One job per encoder:
-#        sbatch --export=ALL,MH_PIPELINE_ROOT=/path/to/mh-data scripts/cluster_extract.sh whisper-medium
-#        sbatch ... scripts/cluster_extract.sh xlsr-300m
-#        sbatch ... scripts/cluster_extract.sh mhubert-147
-#        sbatch ... scripts/cluster_extract.sh hubert-large
+#        bash scripts/cluster_extract.sh setup
+#   2. One job per encoder (submit from the repo root):
+#        sbatch scripts/cluster_extract.sh whisper-medium
+#        sbatch scripts/cluster_extract.sh xlsr-300m
+#        sbatch scripts/cluster_extract.sh mhubert-147
+#        sbatch scripts/cluster_extract.sh hubert-large
 #   3. Verify (any node):
-#        MH_PIPELINE_ROOT=/path/to/mh-data bash scripts/cluster_extract.sh check whisper-medium
+#        bash scripts/cluster_extract.sh check whisper-medium
 #
-# MH_PIPELINE_ROOT must contain (copy from the Mac, see the rsync in the README/notes):
-#   outputs/features/finetune_bucket.csv  (and pretrain_bucket.csv for BUCKET=pretrain)
-#   outputs/data/cleaned/<participant_id>/spontaneous.wav
+# Data: DATA_DIR (default /data/mh/ML_data, the cluster copy). If it is laid out
+# like an mh-ML-pipeline checkout (outputs/features/finetune_bucket.csv,
+# outputs/data/cleaned/...) it is used as MH_PIPELINE_ROOT directly. Otherwise it holds
+#   finetune_bucket.csv  (and pretrain_bucket.csv for BUCKET=pretrain)
+#   cleaned/<participant_id>/spontaneous.wav
+# The bucket's audio_path column is relative to an mh-ML-pipeline checkout
+# (outputs/data/cleaned/...), so a symlinked pipeline-shaped root is built under
+# outputs/mh_root and used as MH_PIPELINE_ROOT. Set MH_PIPELINE_ROOT yourself to
+# point at a real pipeline checkout instead.
 # Optional env: BUCKET=finetune|pretrain (default finetune), MINNS_OUTPUTS (default ./outputs),
 #               WINDOWS="2 5 10 20", LIMIT=3 (first N participants only: a quick test job).
 #
@@ -36,7 +42,29 @@ BUCKET="${BUCKET:-finetune}"
 WINDOWS="${WINDOWS:-2 5 10 20}"
 ENCODERS="whisper-medium xlsr-300m mhubert-147 hubert-large"
 
-: "${MH_PIPELINE_ROOT:?set MH_PIPELINE_ROOT to the directory holding outputs/features/*_bucket.csv and the audio}"
+DATA_DIR="${DATA_DIR:-/data/mh/ML_data}"
+if [ -z "${MH_PIPELINE_ROOT:-}" ] && [ -f "$DATA_DIR/outputs/features/${BUCKET}_bucket.csv" ]; then
+  MH_PIPELINE_ROOT="$DATA_DIR"          # already laid out like an mh-ML-pipeline checkout
+fi
+if [ -z "${MH_PIPELINE_ROOT:-}" ]; then
+  MH_PIPELINE_ROOT="$PWD/outputs/mh_root"
+  mkdir -p "$MH_PIPELINE_ROOT/outputs/features" "$MH_PIPELINE_ROOT/outputs/data"
+  # The CSVs and cleaned/ may sit directly in DATA_DIR or one level down.
+  for b in finetune pretrain; do
+    csv=$(find -L "$DATA_DIR" -maxdepth 2 -name "${b}_bucket.csv" -print -quit 2>/dev/null || true)
+    [ -n "$csv" ] && ln -sfn "$csv" "$MH_PIPELINE_ROOT/outputs/features/${b}_bucket.csv"
+  done
+  cleaned=$(find -L "$DATA_DIR" -maxdepth 2 -type d -name cleaned -print -quit 2>/dev/null || true)
+  [ -n "$cleaned" ] && ln -sfn "$cleaned" "$MH_PIPELINE_ROOT/outputs/data/cleaned"
+  if [ ! -e "$MH_PIPELINE_ROOT/outputs/features/${BUCKET}_bucket.csv" ] || [ -z "$cleaned" ]; then
+    echo "could not find ${BUCKET}_bucket.csv and/or cleaned/ within two levels of DATA_DIR=$DATA_DIR"
+    echo "found: csv=$(readlink "$MH_PIPELINE_ROOT/outputs/features/${BUCKET}_bucket.csv" || echo none)  cleaned=${cleaned:-none}"
+    echo "contents of $DATA_DIR:"; ls -la "$DATA_DIR" || true
+    echo "set DATA_DIR=/the/right/folder, or MH_PIPELINE_ROOT to a pipeline-shaped root"
+    exit 1
+  fi
+  echo "data: csv -> $(readlink "$MH_PIPELINE_ROOT/outputs/features/${BUCKET}_bucket.csv")  cleaned -> $cleaned"
+fi
 export MH_PIPELINE_ROOT
 [ -f "$MH_PIPELINE_ROOT/outputs/features/${BUCKET}_bucket.csv" ] \
   || { echo "missing $MH_PIPELINE_ROOT/outputs/features/${BUCKET}_bucket.csv"; exit 1; }
@@ -60,7 +88,13 @@ EOF
     uv run python - <<'EOF'
 import os, soundfile as sf
 from minns.data import load_bucket
-df = load_bucket(os.environ.get("BUCKET", "finetune"))
+import hashlib
+from minns.data import BUCKETS
+b = os.environ.get("BUCKET", "finetune")
+print(f"{b}_bucket.csv md5", hashlib.md5(BUCKETS[b].read_bytes()).hexdigest(),
+      "(Mac copy, 2026-10-19: 600f43b416ee9bde75fc78e3afaafe42)")
+df = load_bucket(b)
+print(f"labels: {df.label.sum()} positive of {len(df)}; split: {df.split.value_counts().to_dict()}")
 bad = [p for p in df.audio_path if not os.path.exists(p)]
 print(f"{len(df)} participants, {len(bad)} audio files missing", bad[:5])
 rates = {sf.info(p).samplerate for p in df.audio_path if os.path.exists(p)}
