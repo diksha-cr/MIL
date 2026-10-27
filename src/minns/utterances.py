@@ -259,9 +259,9 @@ def read_audio(path: str) -> np.ndarray:
 
 
 def save(name: str, pid: str, sets: dict[str, tuple[np.ndarray, np.ndarray]], info: dict,
-         dtype=np.float32) -> None:
+         dtype=np.float32, full_key: str = "utt") -> None:
     """{key: (features (n, layers, dim), spans (n, 2))} -> outputs/features/windows/<name>/<pid>.npz,
-    extract.py's layout; `full` is the mean over the participant's utterances.
+    extract.py's layout; `full` is the mean over the `full_key` set (the participant's utterances).
 
     Hand-made features stay float32: some eGeMAPS columns are ratios (stddevNorm =
     sd / mean) that reach 3e4 when the mean is near 0 and overflow float16 (max 65504).
@@ -273,7 +273,7 @@ def save(name: str, pid: str, sets: dict[str, tuple[np.ndarray, np.ndarray]], in
     for key, (feats, spans) in sets.items():
         arrays[key] = feats.astype(dtype)
         arrays[f"{key}_span"] = spans.astype(np.float32)
-    arrays["full"] = sets["utt"][0].astype(np.float64).mean(0).astype(dtype)
+    arrays["full"] = sets[full_key][0].astype(np.float64).mean(0).astype(dtype)
     np.savez(tmp, info=json.dumps(info), **arrays)
     tmp.rename(d / f"{pid}.npz")
 

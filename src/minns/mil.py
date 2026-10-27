@@ -45,7 +45,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from minns.data import OUTPUTS, load_bucket
-from minns.evaluation import SEED, cv_folds, format_summary, run_cv
+from minns.evaluation import SEED, cv_folds, format_summary, languages, run_cv
 from minns.extract import pick_device
 from minns.probe import load_packed, window_key
 
@@ -154,14 +154,9 @@ def fit_linear(Xtr, mtr, ytr, wtr, Xva, mva, pool: str, C: float) -> np.ndarray:
 
 # ── one fold ──────────────────────────────────────────────────────────────────
 
-def fit_predict_fold(X, mask, lengths, y, tr, va, models, n_seeds, epochs, device,
-                     C: float = 0.01) -> dict[str, np.ndarray]:
-    """Train every model on bags `tr`, return {model: averaged-over-seeds probabilities for `va`}."""
-    tr_t, va_t = torch.as_tensor(tr, device=device), torch.as_tensor(va, device=device)
-    yt = torch.as_tensor(y, dtype=torch.float32, device=device)
-
-    # Standardise with statistics of the training bags' windows only, skipping missing
-    # values; a missing value then becomes 0 (the training mean), as in the probe.
+def make_standardiser(X: torch.Tensor, mask: torch.Tensor, tr_t: torch.Tensor):
+    """Standardise with statistics of the training bags' instances only, skipping missing
+    values; a missing value then becomes 0 (the training mean), as in the probe."""
     xs = X[tr_t].float()
     ok = mask[tr_t][..., None] & xs.isfinite()
     xs = xs.nan_to_num(0.0)
@@ -169,13 +164,24 @@ def fit_predict_fold(X, mask, lengths, y, tr, va, models, n_seeds, epochs, devic
     mu = (xs * ok).sum((0, 1)) / n
     sd = (((xs - mu) * ok) ** 2).sum((0, 1)).div(n).sqrt().clamp(min=1e-6)
     del xs, ok
+    return lambda x: ((x.float() - mu) / sd).nan_to_num(0.0)
 
-    def standardise(x):
-        return ((x.float() - mu) / sd).nan_to_num(0.0)
 
+def class_weights(y: np.ndarray, tr: np.ndarray, device: str) -> torch.Tensor:
+    """Per-bag loss weight, both classes weighing the same in total over the training bags."""
     n_pos = float(y[tr].sum())
     class_w = torch.tensor([len(tr) / (2 * (len(tr) - n_pos)), len(tr) / (2 * n_pos)], device=device)
-    wt = class_w[yt.long()]
+    return class_w[torch.as_tensor(y, device=device).long()]
+
+
+def fit_predict_fold(X, mask, lengths, y, tr, va, models, n_seeds, epochs, device,
+                     C: float = 0.01) -> dict[str, np.ndarray]:
+    """Train every model on bags `tr`, return {model: averaged-over-seeds probabilities for `va`}."""
+    tr_t, va_t = torch.as_tensor(tr, device=device), torch.as_tensor(va, device=device)
+    yt = torch.as_tensor(y, dtype=torch.float32, device=device)
+
+    standardise = make_standardiser(X, mask, tr_t)
+    wt = class_weights(y, tr, device)
 
     def batch(idx):                     # trim padding to the longest bag in the batch
         t = int(lengths[idx].max())
@@ -255,7 +261,8 @@ def main() -> None:
                 return {f"{prefix}|{m}": p for m, p in res.items()}
 
             summary, oof = run_cv(y, folds, fit_predict, threshold_metric=args.threshold,
-                                  sites=train["meta_site"].to_numpy(), verbose=True)
+                                  sites=train["meta_site"].to_numpy(),
+                                  langs=languages(train), verbose=True)
             print(format_summary(summary))
             print(f"   ({(time.time() - t0) / 60:.1f} min so far)", flush=True)
             summaries.append(summary)

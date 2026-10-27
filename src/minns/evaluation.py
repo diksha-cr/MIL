@@ -84,6 +84,11 @@ def compute_metrics(y_true: np.ndarray, preds: np.ndarray, prob: np.ndarray) -> 
     }
 
 
+def languages(df: pd.DataFrame) -> np.ndarray | None:
+    """Recording language per row (meta_language), for lang_auc; None if the bucket has no such column."""
+    return df["meta_language"].astype(str).to_numpy() if "meta_language" in df else None
+
+
 def within_group_auc(y: np.ndarray, prob: np.ndarray, groups: np.ndarray) -> float:
     """AUC computed inside each group (site) and averaged, weighted by positives.
 
@@ -103,14 +108,15 @@ def within_group_auc(y: np.ndarray, prob: np.ndarray, groups: np.ndarray) -> flo
 def run_cv(y: np.ndarray, folds: list[tuple[np.ndarray, np.ndarray]],
            fit_predict: Callable[[np.ndarray, np.ndarray], dict[str, np.ndarray]],
            threshold_metric: str = "f2", n_splits: int = N_SPLITS,
-           sites: np.ndarray | None = None,
+           sites: np.ndarray | None = None, langs: np.ndarray | None = None,
            verbose: bool = False) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
     """Returns (summary, oof).
 
     summary: one row per config — mean and SD over folds of every metric, plus
     `oof_auc`, the AUC of each repeat's complete out-of-fold vector averaged over
     repeats (less noisy than per-fold AUC with ~13 positives per fold), and, when
-    `sites` is given, `site_auc` — the same out-of-fold vectors scored within site.
+    `sites` is given, `site_auc` — the same out-of-fold vectors scored within site
+    (`lang_auc`: within language, when `langs` is given).
     oof: config -> out-of-fold probability per row, averaged over repeats.
     """
     n_repeats = len(folds) // n_splits
@@ -140,6 +146,8 @@ def run_cv(y: np.ndarray, folds: list[tuple[np.ndarray, np.ndarray]],
         row = {"config": m, "oof_auc": np.mean([roc_auc_score(y, repeat_oof[m][r]) for r in range(n_repeats)])}
         if sites is not None:
             row["site_auc"] = np.mean([within_group_auc(y, repeat_oof[m][r], sites) for r in range(n_repeats)])
+        if langs is not None:
+            row["lang_auc"] = np.mean([within_group_auc(y, repeat_oof[m][r], langs) for r in range(n_repeats)])
         for c in (*METRICS, "thresh"):
             row[c], row[f"{c}_sd"] = pf[c].mean(), pf[c].std()
         for c in COUNTS:                 # every participant scored once per repeat
@@ -155,8 +163,9 @@ def format_summary(summary: pd.DataFrame, sort: str = "auc", top: int | None = N
     if top:
         s = s.head(top)
     cols = ["oof_auc", "auc", "ap", "f2", "f1", "ppv", "recall", "specificity", "npv"]
-    if "site_auc" in s:
-        cols.insert(1, "site_auc")
+    for c in ("lang_auc", "site_auc"):
+        if c in s:
+            cols.insert(1, c)
     out = s[cols].copy()
     out["auc"] = [f"{a:.3f} ± {b:.3f}" for a, b in zip(s["auc"], s["auc_sd"])]
     if "tp" in s:

@@ -46,14 +46,17 @@ from minns.data import OUTPUTS, load_bucket
 from minns.evaluation import SEED, cv_folds, format_summary, run_cv
 
 POOL_OMEGAS = (-10, -1, 1, 10, 100)
+INSTANCE_KEYS = ("full", "utt", "dlg", "seg", "dseg", "word")
+DIALOGUE_ROLES = {"dlg": "role", "dseg": "role-seg"}     # dialogue key -> its one-hot role set
 
 
 # ── packed, layer-major feature cache ─────────────────────────────────────────
 
 def window_key(w: str) -> str:
     """CLI window -> npz key: "full", "utt" / "dlg" (participant / dialogue utterances,
-    minns.utterances) or "w<sec>"."""
-    return w if w in ("full", "utt", "dlg") else f"w{float(w):g}"
+    minns.utterances), "seg" / "dseg" / "word" (participant / dialogue TextGrid segments,
+    participant words, minns.segments) or "w<sec>"."""
+    return w if w in INSTANCE_KEYS else f"w{float(w):g}"
 
 
 def load_packed(encoder: str, key: str, pids: list[str]) -> tuple[np.ndarray, np.ndarray]:
@@ -66,6 +69,9 @@ def load_packed(encoder: str, key: str, pids: list[str]) -> tuple[np.ndarray, np
     "a+b" concatenates feature sets along the feature axis, e.g. egemaps+prosody
     or whisper-medium-utt+prosody. They must share their instances (the utterance
     sets do); a single-layer set is repeated across the other set's layers.
+
+    "set@L" keeps layer L only, e.g. whisper-medium-seg+xlmr-large-seg@16: every
+    audio layer paired with text layer 16, not layer k with layer k.
     """
     if "+" in encoder:
         parts = [load_packed(e, key, pids) for e in encoder.split("+")]
@@ -76,6 +82,12 @@ def load_packed(encoder: str, key: str, pids: list[str]) -> tuple[np.ndarray, np
         if any(f.shape[0] not in (1, n_layers) for f, _ in parts):
             raise SystemExit(f"{encoder}: layer counts {[f.shape[0] for f, _ in parts]} cannot be combined")
         return np.concatenate([np.broadcast_to(f, (n_layers, *f.shape[1:])) for f, _ in parts], axis=2), owner
+    if "@" in encoder:
+        name, layer = encoder.rsplit("@", 1)
+        feats, owner = load_packed(name, key, pids)
+        if not 0 <= int(layer) < feats.shape[0]:
+            raise SystemExit(f"{name} has layers 0..{feats.shape[0] - 1}; asked for {layer}")
+        return feats[int(layer):int(layer) + 1], owner
 
     src = OUTPUTS / "features/windows" / encoder
     dst = OUTPUTS / "features/packed" / encoder
@@ -191,7 +203,8 @@ def main() -> None:
     ap.add_argument("--encoder", required=True)
     ap.add_argument("--windows", nargs="+", default=["full", "2", "5", "10", "20"],
                     help="window sizes in seconds, 'full' (one mean embedding per participant) "
-                         "and/or 'utt' (utterances, from minns.utterances)")
+                         "and/or 'utt' / 'dlg' (utterances, minns.utterances), 'seg' / 'dseg' / 'word' "
+                         "(TextGrid segments and words, minns.segments)")
     ap.add_argument("--layers", nargs="+", default=["all"])
     ap.add_argument("--C", type=float, default=0.01, help="inverse L2 strength of every probe")
     ap.add_argument("--cv", choices=["random", "site"], default="random")
@@ -210,11 +223,11 @@ def main() -> None:
     keys = [window_key(w) for w in args.windows]
     data = {k: load_packed(args.encoder, k, pids) for k in keys}
     roles = {}
-    if "dlg" in data:                  # speaker role of every dialogue utterance, for per-role pooling
-        onehot, owner = load_packed("role", "dlg", pids)
-        if not np.array_equal(owner, data["dlg"][1]):
-            raise SystemExit("role and feature sets have different dialogue utterances; re-run minns.utterances")
-        roles["dlg"] = np.asarray(onehot[0], dtype=np.float32).argmax(1)
+    for k in set(DIALOGUE_ROLES) & set(data):   # speaker role of every dialogue instance, for per-role pooling
+        onehot, owner = load_packed(DIALOGUE_ROLES[k], k, pids)
+        if not np.array_equal(owner, data[k][1]):
+            raise SystemExit(f"{DIALOGUE_ROLES[k]} and feature sets have different {k} instances; re-segment")
+        roles[k] = np.asarray(onehot[0], dtype=np.float32).argmax(1)
     n_layers = next(iter(data.values()))[0].shape[0]
     layers = list(range(n_layers)) if args.layers == ["all"] else [int(l) for l in args.layers]
     if not all(0 <= l < n_layers for l in layers):
