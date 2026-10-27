@@ -79,8 +79,6 @@ def main() -> None:
     ap.add_argument("--C", type=float, default=0.01, help="L2 strength of MIL lin-* models (probe C comes from its CSV name)")
     ap.add_argument("--threshold", default="f2")
     args = ap.parse_args()
-    args.configs = sorted(args.configs, key=lambda c: not is_baseline(c))     # baseline first
-    colors = series_colors(args.configs)
 
     df = load_bucket("finetune")
     split = df["split"].to_numpy()
@@ -104,6 +102,8 @@ def main() -> None:
     missing = [c for c in args.configs if c not in source]
     if missing:
         raise SystemExit(f"not in the given runs: {missing}")
+    args.configs = sorted(args.configs, key=lambda c: not is_baseline(c))     # baseline first
+    colors = series_colors(args.configs)
 
     rows, curves, probs = [], [], {}
     labels = display_labels(args.configs)

@@ -209,11 +209,12 @@ def main() -> None:
         configs = best[args.by_window].tolist() if args.by_window else best.tolist()
     else:
         configs = summary.index[:args.top].tolist()
+    unknown = [c for c in configs if c not in probs]
+    if unknown:
+        raise SystemExit(f"not in the given runs: {unknown}\nconfig names are the first column of the CSVs, "
+                         "e.g. whisper-medium|w5|L23|max")
     configs = sorted(configs, key=lambda c: not is_baseline(c))       # baseline first
     colors = series_colors(configs)
-    missing = [c for c in configs if c not in probs]
-    if missing:
-        raise SystemExit(f"no out-of-fold predictions for {missing}")
 
     df = load_bucket("finetune")
     train = df[df["split"] == "train"].reset_index(drop=True)
