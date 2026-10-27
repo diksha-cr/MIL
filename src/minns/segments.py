@@ -129,9 +129,9 @@ def build_table(pid: str, total_sec: float, rule: str) -> dict:
     # word -> stage-D dialogue utterance of the same speaker containing its midpoint
     utt_path = UTT_DIR / f"{pid}.json"
     words["dlg_utt"] = [-1] * len(words["text"])
-    has_utts = utt_path.exists()
+    meta = json.loads(utt_path.read_text()) if utt_path.exists() else {}
+    has_utts = "dlg_spans" in meta          # stage D run before role tagging has no dialogue spans
     if has_utts:
-        meta = json.loads(utt_path.read_text())
         spans = np.asarray(meta["dlg_spans"], dtype=float).reshape(-1, 2)
         u_roles = np.asarray(meta["dlg_roles"])
         mid = (np.asarray(words["start"]) + np.asarray(words["end"])) / 2
@@ -283,6 +283,13 @@ def main() -> None:
         todo = [r for r in rows if args.overwrite or not (target / f"{r[0]}.npz").exists()]
         print(f"tables for {len(todo)}/{len(rows)} participants (rule={args.rule}, egemaps={args.egemaps})",
               flush=True)
+        old = [pid for pid, _ in todo if (UTT_DIR / f"{pid}.json").exists()
+               and "dlg_spans" not in json.loads((UTT_DIR / f"{pid}.json").read_text())]
+        if old:
+            print(f"warning: {len(old)} stage-D utterance files predate role tagging (no dlg_spans); their words "
+                  "get no utterance link and minns.text writes no -utt set for them. To get one, re-run "
+                  "`minns.utterances --features prosody --overwrite`, then these tables with --overwrite.",
+                  flush=True)
         for line in Parallel(n_jobs=args.jobs, return_as="generator")(
                 delayed(build)(pid, path, args.rule, args.egemaps) for pid, path in todo):
             print(line, flush=True)
