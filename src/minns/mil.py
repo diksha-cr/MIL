@@ -175,8 +175,11 @@ def class_weights(y: np.ndarray, tr: np.ndarray, device: str) -> torch.Tensor:
 
 
 def fit_predict_fold(X, mask, lengths, y, tr, va, models, n_seeds, epochs, device,
-                     C: float = 0.01) -> dict[str, np.ndarray]:
-    """Train every model on bags `tr`, return {model: averaged-over-seeds probabilities for `va`}."""
+                     C: float = 0.01, seed_offset: int = 0) -> dict[str, np.ndarray]:
+    """Train every model on bags `tr`, return {model: averaged-over-seeds probabilities for `va`}.
+
+    Initialisations use seeds SEED + seed_offset + 0 .. n_seeds - 1.
+    """
     tr_t, va_t = torch.as_tensor(tr, device=device), torch.as_tensor(va, device=device)
     yt = torch.as_tensor(y, dtype=torch.float32, device=device)
 
@@ -199,10 +202,10 @@ def fit_predict_fold(X, mask, lengths, y, tr, va, models, n_seeds, epochs, devic
     for model_name in (m for m in models if not m.startswith("lin-")):
         probs = []
         for seed in range(n_seeds):
-            torch.manual_seed(SEED + seed)
+            torch.manual_seed(SEED + seed_offset + seed)
             net = MINN(X.shape[-1], model_name).to(device)
             opt = torch.optim.Adam(net.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-            gen = torch.Generator().manual_seed(SEED + seed)
+            gen = torch.Generator().manual_seed(SEED + seed_offset + seed)
             for _ in range(epochs):
                 net.train()
                 for b in torch.randperm(len(tr), generator=gen).split(BATCH):

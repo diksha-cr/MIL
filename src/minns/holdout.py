@@ -18,6 +18,15 @@ test, the AUC's CI is about +-0.1 wide; read it next to the CV number, not inste
         outputs/results/stage_b/probe_whisper-medium-utt+prosody_random_C0.01.csv \
         --configs "whisper-medium-utt+prosody|full|L24|mean" "whisper-medium-utt+prosody|utt|L24|mean"
     python -m minns.holdout --name probe_vs_mil <probe csv> <mil csv> --configs <probe config> <mil config>
+
+--seed-sets K (MIL configs only): how much the test AUC depends on the networks'
+random initialisation. Each config is refitted K times, seed set k using seeds
+SEED + 5k .. SEED + 5k + 4 (k = 0 is the run above), and EVERY set's test AUC is
+reported, plus their mean +- SD. Quote the mean, decided before running; picking the
+best set would make the test split a validation set again. Writes
+results/test/<name>_seeds<K>_test.csv; the single-run outputs are not touched.
+
+    python -m minns.holdout --name fusion_seg_top4 <mil csv> --configs <config> ... --seed-sets 10
 """
 from __future__ import annotations
 
@@ -56,7 +65,7 @@ def probe_test(config: str, C: float, df: pd.DataFrame, train_rows, test_rows) -
     return scores[pool]                       # in sorted test-row order, i.e. test_rows' order
 
 
-def mil_test(config: str, C: float, df: pd.DataFrame, train_rows, test_rows) -> np.ndarray:
+def mil_test(config: str, C: float, df: pd.DataFrame, train_rows, test_rows, seed_offset: int = 0) -> np.ndarray:
     from minns.extract import pick_device
     from minns.mil import EPOCHS, N_SEEDS, fit_predict_fold, padded_bags
     from minns.probe import load_packed
@@ -68,7 +77,38 @@ def mil_test(config: str, C: float, df: pd.DataFrame, train_rows, test_rows) -> 
     X, mask, lengths = padded_bags(np.asarray(feats[int(layer[1:])]), owner, bags, device)
     y = df["label"].to_numpy()[bags].copy()
     tr, te = np.arange(len(train_rows)), np.arange(len(train_rows), len(bags))
-    return fit_predict_fold(X, mask, lengths, y, tr, te, [model], N_SEEDS, EPOCHS, device, C)[model]
+    return fit_predict_fold(X, mask, lengths, y, tr, te, [model], N_SEEDS, EPOCHS, device, C, seed_offset)[model]
+
+
+def seed_stability(args, source, df, train_rows, test_rows, y_tr, y_te) -> None:
+    from minns.mil import N_SEEDS
+    rows = []
+    for c in args.configs:
+        kind, C, oof = source[c]
+        if kind != "mil":
+            print(f"\n{c}: a probe is deterministic, no seeds to vary; skipped")
+            continue
+        thr = best_threshold(y_tr, oof, args.threshold)
+        print(f"\n{c}   (threshold {thr:.3f} from train CV)")
+        for k in range(args.seed_sets):
+            p = mil_test(c, C, df, train_rows, test_rows, seed_offset=k * N_SEEDS)
+            pred, yt = p >= thr, y_te == 1
+            tp, fn, fp, tn = (pred & yt).sum(), (~pred & yt).sum(), (pred & ~yt).sum(), (~pred & ~yt).sum()
+            auc = roc_auc_score(y_te, p)
+            print(f"   seed set {k:2d}: AUC {auc:.3f}   TP/FN/FP/TN {tp}/{fn}/{fp}/{tn}", flush=True)
+            rows.append(dict(config=c, seed_set=k, test_auc=auc, threshold=thr, tp=tp, fn=fn, fp=fp, tn=tn,
+                             recall=tp / max(tp + fn, 1), specificity=tn / max(tn + fp, 1)))
+    if not rows:
+        return
+    res = pd.DataFrame(rows)
+    agg = res.groupby("config", sort=False)[["test_auc", "recall", "specificity"]].agg(["mean", "std", "min", "max"])
+    print(f"\nAcross {args.seed_sets} seed sets (quote the mean):")
+    with pd.option_context("display.width", 250, "display.max_columns", None):
+        print(agg.to_string(float_format=lambda v: f"{v:.3f}"))
+    out_dir = OUTPUTS / "results/test"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    res.to_csv(out_dir / f"{args.name}_seeds{args.seed_sets}_test.csv", index=False)
+    print(f"\n-> {out_dir / args.name}_seeds{args.seed_sets}_test.csv")
 
 
 def main() -> None:
@@ -78,6 +118,8 @@ def main() -> None:
     ap.add_argument("--name", required=True, help="output file name, e.g. utt_vs_full")
     ap.add_argument("--C", type=float, default=0.01, help="L2 strength of MIL lin-* models (probe C comes from its CSV name)")
     ap.add_argument("--threshold", default="f2")
+    ap.add_argument("--seed-sets", type=int, default=1, help="refit each MIL config with this many seed sets "
+                    "and report every test AUC with their mean +- SD (see above)")
     args = ap.parse_args()
 
     df = load_bucket("finetune")
@@ -102,6 +144,8 @@ def main() -> None:
     missing = [c for c in args.configs if c not in source]
     if missing:
         raise SystemExit(f"not in the given runs: {missing}")
+    if args.seed_sets > 1:
+        return seed_stability(args, source, df, train_rows, test_rows, y_tr, y_te)
     args.configs = sorted(args.configs, key=lambda c: not is_baseline(c))     # baseline first
     colors = series_colors(args.configs)
 
