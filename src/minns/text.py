@@ -20,6 +20,7 @@ Feature sets (outputs/features/windows/<set>/<pid>.npz, float16, every layer):
 
     python -m minns.text --encoder xlmr-large --limit 3
     python -m minns.text --encoder sbert-mpnet
+    python -m minns.text --encoder mbert-base
 """
 from __future__ import annotations
 
@@ -38,6 +39,7 @@ TEXT_ENCODERS = {
     "xlmr-large": "FacebookAI/xlm-roberta-large",          # 24 blocks, 1024-D
     "muril-large": "google/muril-large-cased",              # Indic + transliterated, 24 blocks, 1024-D
     "sbert-mpnet": "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",   # the pipeline's SBERT
+    "mbert-base": "google-bert/bert-base-multilingual-cased",   # multilingual BERT (kn/te/ta/en), 12 blocks, 768-D
 }
 MAX_TOKENS = 256
 

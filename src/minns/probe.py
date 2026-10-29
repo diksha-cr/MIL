@@ -84,6 +84,8 @@ def load_packed(encoder: str, key: str, pids: list[str]) -> tuple[np.ndarray, np
         return np.concatenate([np.broadcast_to(f, (n_layers, *f.shape[1:])) for f, _ in parts], axis=2), owner
     if "@" in encoder:
         name, layer = encoder.rsplit("@", 1)
+        if not layer.isdigit():
+            raise SystemExit(f"{encoder}: the part after @ must be a layer number, e.g. {name}@16")
         feats, owner = load_packed(name, key, pids)
         if not 0 <= int(layer) < feats.shape[0]:
             raise SystemExit(f"{name} has layers 0..{feats.shape[0] - 1}; asked for {layer}")

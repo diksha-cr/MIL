@@ -17,6 +17,18 @@
 #      Text-layer probe first (picks the @ layer):
 #        PROBE_ARGS="--windows seg" sbatch scripts/cluster_probe.sh xlmr-large-seg random
 #
+# Text encoder comparison (stage-B style: layer x instance x pooling, one probe per set):
+#   for enc in mbert-base xlmr-large muril-large sbert-mpnet; do
+#     sbatch --gres=gpu:1 --mem=32G --job-name=text-$enc scripts/cluster_text.sh text $enc
+#   done
+#   # after those finish (each set's first probe repacks it, so one job per set):
+#   for enc in mbert-base xlmr-large muril-large sbert-mpnet; do
+#     PROBE_ARGS="--windows full seg dseg" sbatch --job-name=probe-$enc-seg  scripts/cluster_probe.sh $enc-seg
+#     PROBE_ARGS="--windows word"          sbatch --job-name=probe-$enc-word scripts/cluster_probe.sh $enc-word
+#     PROBE_ARGS="--windows utt dlg"       sbatch --job-name=probe-$enc-utt  scripts/cluster_probe.sh $enc-utt
+#   done
+#   python -m minns.summarise -seg_      # then -word_, -utt_: best layer, window x pooling per encoder
+#
 # Resumable: participants that already have an .npz are skipped. Rebuilding the tables
 # (TEXT_ARGS=--overwrite on step 1) needs --overwrite on steps 2 and 3 too, so every
 # set keeps the same instances.
