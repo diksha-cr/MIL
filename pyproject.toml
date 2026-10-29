@@ -10,6 +10,7 @@ requires-python = ">=3.13"
 dependencies = [
     "openai-whisper>=20250625",
     "opensmile>=2.6.0",
+    "optuna>=4",
     "pandas>=3.0.6",
     "scikit-learn>=1.9.1",
     "scipy>=1.18.1",

@@ -99,12 +99,12 @@ def masked_pool(h: torch.Tensor, mask: torch.Tensor, how: str) -> torch.Tensor:
 # ── networks ──────────────────────────────────────────────────────────────────
 
 class MINN(nn.Module):
-    def __init__(self, dim: int, model: str):
+    def __init__(self, dim: int, model: str, hidden: tuple[int, ...] = HIDDEN, dropout: float = DROPOUT):
         super().__init__()
         self.kind, _, self.pool = model.partition("-")
         layers, d = [], dim
-        for h in HIDDEN:
-            layers += [nn.Linear(d, h), nn.ReLU(), nn.Dropout(DROPOUT)]
+        for h in hidden:
+            layers += [nn.Linear(d, h), nn.ReLU(), nn.Dropout(dropout)]
             d = h
         self.body = nn.Sequential(*layers)
         if self.kind == "attention":
@@ -175,10 +175,13 @@ def class_weights(y: np.ndarray, tr: np.ndarray, device: str) -> torch.Tensor:
 
 
 def fit_predict_fold(X, mask, lengths, y, tr, va, models, n_seeds, epochs, device,
-                     C: float = 0.01, seed_offset: int = 0) -> dict[str, np.ndarray]:
+                     C: float = 0.01, seed_offset: int = 0, lr: float = LR, weight_decay: float = WEIGHT_DECAY,
+                     batch_size: int = BATCH, hidden: tuple[int, ...] = HIDDEN,
+                     dropout: float = DROPOUT) -> dict[str, np.ndarray]:
     """Train every model on bags `tr`, return {model: averaged-over-seeds probabilities for `va`}.
 
-    Initialisations use seeds SEED + seed_offset + 0 .. n_seeds - 1.
+    Initialisations use seeds SEED + seed_offset + 0 .. n_seeds - 1. The network
+    hyperparameters default to the a-priori ones above (minns.tune searches them).
     """
     tr_t, va_t = torch.as_tensor(tr, device=device), torch.as_tensor(va, device=device)
     yt = torch.as_tensor(y, dtype=torch.float32, device=device)
@@ -203,12 +206,12 @@ def fit_predict_fold(X, mask, lengths, y, tr, va, models, n_seeds, epochs, devic
         probs = []
         for seed in range(n_seeds):
             torch.manual_seed(SEED + seed_offset + seed)
-            net = MINN(X.shape[-1], model_name).to(device)
-            opt = torch.optim.Adam(net.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+            net = MINN(X.shape[-1], model_name, hidden, dropout).to(device)
+            opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=weight_decay)
             gen = torch.Generator().manual_seed(SEED + seed_offset + seed)
             for _ in range(epochs):
                 net.train()
-                for b in torch.randperm(len(tr), generator=gen).split(BATCH):
+                for b in torch.randperm(len(tr), generator=gen).split(batch_size):
                     idx = tr_t[b.to(device)]
                     p = net(*batch(idx)).clamp(1e-6, 1 - 1e-6)
                     loss = F.binary_cross_entropy(p, yt[idx], weight=wt[idx])
