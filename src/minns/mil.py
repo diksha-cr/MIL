@@ -232,6 +232,8 @@ def main() -> None:
     ap.add_argument("--threshold", default="f2")
     ap.add_argument("--seeds", type=int, default=N_SEEDS)
     ap.add_argument("--epochs", type=int, default=EPOCHS)
+    ap.add_argument("--repeats", type=int, default=1, help="repeats of the 5-fold CV, each with new folds "
+                    "(> 1 writes a separate _5x<R> file; holdout.py needs the single-repeat one)")
     args = ap.parse_args()
 
     device = pick_device()
@@ -240,12 +242,12 @@ def main() -> None:
     train_rows = np.flatnonzero(df["split"].to_numpy() == "train")   # test split never loaded into a bag
     train = df.iloc[train_rows].reset_index(drop=True)
     y = train["label"].to_numpy().copy()        # writable: torch warns on read-only arrays
-    folds = cv_folds(train, group_field="meta_site" if args.cv == "site" else None)
+    folds = cv_folds(train, group_field="meta_site" if args.cv == "site" else None, n_repeats=args.repeats)
     print(f"{args.encoder}: windows {args.windows}, layers {args.layers}, models {args.models}, "
           f"{args.cv} CV, {len(folds)} folds, {args.seeds} seeds x {args.epochs} epochs, device={device}, "
           f"train {len(y)} ({y.sum()} positive)")
 
-    summaries, oofs, t0 = [], {}, time.time()
+    summaries, oofs, repeat_oofs, t0 = [], {}, {}, time.time()
     for w in args.windows:
         key = window_key(w)
         feats, owner = load_packed(args.encoder, key, pids)
@@ -260,13 +262,14 @@ def main() -> None:
                 res = fit_predict_fold(X, mask, lengths, y, tr, va, args.models, args.seeds, args.epochs, device, args.C)
                 return {f"{prefix}|{m}": p for m, p in res.items()}
 
-            summary, oof = run_cv(y, folds, fit_predict, threshold_metric=args.threshold,
-                                  sites=train["meta_site"].to_numpy(),
-                                  langs=languages(train), verbose=True)
+            summary, oof, repeat_oof = run_cv(y, folds, fit_predict, threshold_metric=args.threshold,
+                                              sites=train["meta_site"].to_numpy(),
+                                              langs=languages(train), verbose=True, keep_repeats=True)
             print(format_summary(summary))
             print(f"   ({(time.time() - t0) / 60:.1f} min so far)", flush=True)
             summaries.append(summary)
             oofs.update(oof)
+            repeat_oofs.update(repeat_oof)
             del X, mask, lengths
             if device == "cuda":
                 torch.cuda.empty_cache()
@@ -279,10 +282,12 @@ def main() -> None:
 
     out_dir = OUTPUTS / "results/stage_c"
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"mil_{args.encoder}_{args.cv}" + ("_linear" if all(m.startswith("lin-") for m in args.models) else "")
+    stem = f"mil_{args.encoder}_{args.cv}" + ("_linear" if all(m.startswith("lin-") for m in args.models) else "") \
+        + (f"_5x{args.repeats}" if args.repeats > 1 else "")
     summary.to_csv(out_dir / f"{stem}.csv")
+    extra = {"prob_repeats": np.stack(list(repeat_oofs.values()))} if args.repeats > 1 else {}
     np.savez_compressed(out_dir / f"{stem}_oof.npz", participant_id=train["participant_id"].to_numpy(dtype=str),
-                        config=np.array(list(oofs)), prob=np.stack(list(oofs.values())))
+                        config=np.array(list(oofs)), prob=np.stack(list(oofs.values())), **extra)
     print(f"\n{len(summary)} configs in {(time.time() - t0) / 60:.1f} min -> {out_dir / stem}.csv")
     print(f"\nAll configs by fold AUC:\n{format_summary(summary)}")
 

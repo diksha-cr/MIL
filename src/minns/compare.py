@@ -6,6 +6,9 @@ delta     Paired bootstrap over participants of AUC(config) - AUC(reference) and
           participants, so the bootstrap resamples participants and recomputes both
           AUCs on each resample. Reported: delta, 95 % percentile CI, and the share of
           resamples where the config is not better (a one-sided bootstrap p).
+          Runs with repeated CV (mil.py --repeats, which saves prob_repeats) also get
+          repeat_wins: in how many CV repeats (each with new folds) the config's AUC
+          beats the reference's, and the per-repeat AUC difference's range.
 
 confound  How well a feature set's participant-mean vector predicts site and language
           (5-fold balanced logistic regression, train split), against the majority
@@ -63,6 +66,12 @@ def load_oof(path: str) -> dict[str, pd.Series]:
     return {str(c): pd.Series(p, index=pid) for c, p in zip(z["config"], z["prob"])}
 
 
+def load_repeats(path: str) -> dict[str, np.ndarray]:
+    """config -> (n_repeats, rows) probabilities; empty if the run had a single repeat."""
+    z = np.load(path, allow_pickle=True)
+    return {str(c): p for c, p in zip(z["config"], z["prob_repeats"])} if "prob_repeats" in z else {}
+
+
 def pick(oofs: dict[str, pd.Series], name: str | None, path: str) -> tuple[str, pd.Series]:
     if name is None:
         if len(oofs) != 1:
@@ -107,6 +116,7 @@ def run_delta(args) -> None:
     df = load_bucket("finetune").set_index("participant_id")
     ref_path, ref_name = split_spec(args.ref)
     ref_cfg, ref = pick(load_oof(ref_path), ref_name, ref_path)
+    ref_reps = load_repeats(ref_path).get(ref_cfg)
     rows = {}
     for spec in args.against:
         path, name = split_spec(spec)
@@ -121,6 +131,11 @@ def run_delta(args) -> None:
             y = df.loc[common, "label"].to_numpy()
             sites = df.loc[common, "meta_site"].astype(str).to_numpy()
             rows[cfg] = delta(ref.loc[common], s.loc[common], y, sites, np.random.default_rng(SEED))
+            reps = load_repeats(path).get(cfg)
+            if ref_reps is not None and reps is not None and ref.index.equals(s.index) and len(reps) == len(ref_reps):
+                yr = df.loc[ref.index, "label"].to_numpy()
+                d = np.array([roc_auc_score(yr, b) - roc_auc_score(yr, a) for a, b in zip(ref_reps, reps)])
+                rows[cfg].update(repeat_wins=f"{(d > 0).sum()}/{len(d)}", d_auc_rep_min=d.min(), d_auc_rep_max=d.max())
     out = pd.DataFrame(rows).T.sort_values("d_site_auc", ascending=False)
     print(f"reference: {ref_cfg}\n  AUC {roc_auc_score(df.loc[ref.index, 'label'], ref):.3f}, "
           f"{N_BOOT} paired bootstrap resamples over participants\n")

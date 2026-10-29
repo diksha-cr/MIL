@@ -109,8 +109,8 @@ def run_cv(y: np.ndarray, folds: list[tuple[np.ndarray, np.ndarray]],
            fit_predict: Callable[[np.ndarray, np.ndarray], dict[str, np.ndarray]],
            threshold_metric: str = "f2", n_splits: int = N_SPLITS,
            sites: np.ndarray | None = None, langs: np.ndarray | None = None,
-           verbose: bool = False) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
-    """Returns (summary, oof).
+           verbose: bool = False, keep_repeats: bool = False):
+    """Returns (summary, oof), plus repeat_oof if keep_repeats.
 
     summary: one row per config — mean and SD over folds of every metric, plus
     `oof_auc`, the AUC of each repeat's complete out-of-fold vector averaged over
@@ -118,6 +118,7 @@ def run_cv(y: np.ndarray, folds: list[tuple[np.ndarray, np.ndarray]],
     `sites` is given, `site_auc` — the same out-of-fold vectors scored within site
     (`lang_auc`: within language, when `langs` is given).
     oof: config -> out-of-fold probability per row, averaged over repeats.
+    repeat_oof: config -> (n_repeats, rows) out-of-fold probabilities, one row per repeat.
     """
     n_repeats = len(folds) // n_splits
     fold_probs: list[dict[str, np.ndarray]] = []
@@ -155,7 +156,7 @@ def run_cv(y: np.ndarray, folds: list[tuple[np.ndarray, np.ndarray]],
         rows.append(row)
     summary = pd.DataFrame(rows).set_index("config")
     oof = {m: np.nanmean(repeat_oof[m], axis=0) for m in names}
-    return summary, oof
+    return (summary, oof, repeat_oof) if keep_repeats else (summary, oof)
 
 
 def format_summary(summary: pd.DataFrame, sort: str = "auc", top: int | None = None) -> str:
