@@ -99,7 +99,8 @@ def masked_pool(h: torch.Tensor, mask: torch.Tensor, how: str) -> torch.Tensor:
 # ── networks ──────────────────────────────────────────────────────────────────
 
 class MINN(nn.Module):
-    def __init__(self, dim: int, model: str, hidden: tuple[int, ...] = HIDDEN, dropout: float = DROPOUT):
+    def __init__(self, dim: int, model: str, hidden: tuple[int, ...] = HIDDEN, dropout: float = DROPOUT,
+                 attn_dim: int = 64):
         super().__init__()
         self.kind, _, self.pool = model.partition("-")
         layers, d = [], dim
@@ -108,7 +109,8 @@ class MINN(nn.Module):
             d = h
         self.body = nn.Sequential(*layers)
         if self.kind == "attention":
-            self.att_v, self.att_u, self.att_w = nn.Linear(d, 64), nn.Linear(d, 64), nn.Linear(64, 1)
+            self.att_v, self.att_u = nn.Linear(d, attn_dim), nn.Linear(d, attn_dim)
+            self.att_w = nn.Linear(attn_dim, 1)
         self.head = nn.Linear(d, 1)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -177,11 +179,11 @@ def class_weights(y: np.ndarray, tr: np.ndarray, device: str) -> torch.Tensor:
 def fit_predict_fold(X, mask, lengths, y, tr, va, models, n_seeds, epochs, device,
                      C: float = 0.01, seed_offset: int = 0, lr: float = LR, weight_decay: float = WEIGHT_DECAY,
                      batch_size: int = BATCH, hidden: tuple[int, ...] = HIDDEN,
-                     dropout: float = DROPOUT) -> dict[str, np.ndarray]:
+                     dropout: float = DROPOUT, attn_dim: int = 64) -> dict[str, np.ndarray]:
     """Train every model on bags `tr`, return {model: averaged-over-seeds probabilities for `va`}.
 
     Initialisations use seeds SEED + seed_offset + 0 .. n_seeds - 1. The network
-    hyperparameters default to the a-priori ones above (minns.tune searches them).
+    hyperparameters default to the a-priori ones above.
     """
     tr_t, va_t = torch.as_tensor(tr, device=device), torch.as_tensor(va, device=device)
     yt = torch.as_tensor(y, dtype=torch.float32, device=device)
@@ -206,7 +208,7 @@ def fit_predict_fold(X, mask, lengths, y, tr, va, models, n_seeds, epochs, devic
         probs = []
         for seed in range(n_seeds):
             torch.manual_seed(SEED + seed_offset + seed)
-            net = MINN(X.shape[-1], model_name, hidden, dropout).to(device)
+            net = MINN(X.shape[-1], model_name, hidden, dropout, attn_dim).to(device)
             opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=weight_decay)
             gen = torch.Generator().manual_seed(SEED + seed_offset + seed)
             for _ in range(epochs):
